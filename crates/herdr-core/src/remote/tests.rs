@@ -1,7 +1,110 @@
+use super::mirror::mirror_event;
 use super::*;
 use crate::events::{Filter, Sink};
 use crate::paths::Paths;
 use std::sync::atomic::AtomicBool;
+
+#[tokio::test]
+async fn callback_grants_come_from_the_local_request_not_the_remote_parent() {
+    let root = std::path::PathBuf::from(format!("/var/tmp/hc-callback-grants-{}", crate::platform::random_hex()));
+    let paths = Paths {
+        socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
+        state: root.clone(),
+        config: root.join("config.toml"),
+    };
+    paths.create_dirs().unwrap();
+    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "desktop".into() }).unwrap();
+    let machine = Machine {
+        name: "away".into(),
+        target: "away".into(),
+        via: false,
+        temporary: false,
+        session: None,
+        id: "remote".into(),
+        host: "away".into(),
+        version: "test".into(),
+    };
+    for _ in 0..2 {
+        core.lock()
+            .reg
+            .create(crate::terminals::NewTerminal { argv: vec!["x".into()], ..Default::default() }, 0)
+            .unwrap();
+    }
+    let (frames, mut rx) = mpsc::unbounded_channel();
+    let line = Line::new(frames, &json!({}));
+    core.lock().lines.insert(machine.id.clone(), LineState::Connected(line.clone()));
+    for (params, allowed) in [
+        (json!({}), false),
+        (json!({"caller": "here/t1", "no_parent": true}), false),
+        (json!({"caller": "here/t1", "parent": "t2"}), false),
+        (json!({"caller": "other/t1"}), false),
+        (json!({"caller": "here/t1"}), true),
+    ] {
+        let mut params = params;
+        params["argv"] = json!(["x"]);
+        let (calling, remote) = (core.clone(), machine.clone());
+        let task = tokio::spawn(async move { forward_once(&calling, &remote, "terminal.run", params).await });
+        let request = rx.recv().await.unwrap();
+        let request: Value = serde_json::from_slice(&request[wire::HEADER..]).unwrap();
+        line.take_reply(json!({"id": request["id"], "result": {"address": "t1", "parent": "here/t2"}}));
+        task.await.unwrap().unwrap();
+        for (terminal, granted) in [("t1", allowed), ("t2", false)] {
+            from_machine(
+                core.clone(),
+                machine.clone(),
+                line.clone(),
+                json!({"id": 99, "method": "terminal.get", "params": {"terminal": terminal}}),
+            )
+            .await;
+            let reply = rx.recv().await.unwrap();
+            let reply: Value = serde_json::from_slice(&reply[wire::HEADER..]).unwrap();
+            assert_eq!(reply["error"].is_null(), granted, "{terminal}: {reply}");
+            if !granted {
+                assert_eq!(reply["error"]["data"]["kind"], "denied");
+            }
+        }
+    }
+    drop(core);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn remote_event_lines_cannot_accumulate_past_the_frame_limit() {
+    let root = std::path::PathBuf::from(format!("/var/tmp/hc-event-limit-{}", crate::platform::random_hex()));
+    let paths = Paths {
+        socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
+        state: root.clone(),
+        config: root.join("config.toml"),
+    };
+    paths.create_dirs().unwrap();
+    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
+    let machine = Machine {
+        name: "away".into(),
+        target: "away".into(),
+        via: false,
+        temporary: false,
+        session: None,
+        id: "remote".into(),
+        host: "away".into(),
+        version: "test".into(),
+    };
+    let (frames, _rx) = mpsc::unbounded_channel();
+    let line = Line::new(frames, &json!({}));
+    let chunk = vec![b'x'; wire::MAX_PAYLOAD / 2];
+    mirror_events(&core, &machine, &line, b"{").unwrap();
+    mirror_events(&core, &machine, &line, b"}\n{}\n").unwrap();
+    assert!(lock(&line.mirror).2.is_empty(), "split and batched lines are consumed");
+    mirror_events(&core, &machine, &line, &chunk).unwrap();
+    mirror_events(&core, &machine, &line, &chunk).unwrap();
+    for suffix in [b"x".as_slice(), b"\n"] {
+        assert!(mirror_events(&core, &machine, &line, suffix).is_err(), "oversized events must end the line");
+    }
+    assert!(lock(&line.mirror).2.len() <= wire::MAX_PAYLOAD, "incomplete events must stay bounded");
+    drop(core);
+    std::fs::remove_dir_all(root).unwrap();
+}
 
 #[test]
 fn automatic_input_requires_support_at_every_hop() {
@@ -243,7 +346,8 @@ fn remote_misses_and_renames_keep_subscribers_on_the_current_machine() {
     }
     let (frames, _rx) = mpsc::unbounded_channel();
     let line = Line::new(frames, &json!({}));
-    mirror_events(&core, &machine, &line, b"{\"method\":\"missed\",\"params\":{\"seq\":9999,\"terminals\":[]}}\n");
+    mirror_events(&core, &machine, &line, b"{\"method\":\"missed\",\"params\":{\"seq\":9999,\"terminals\":[]}}\n")
+        .unwrap();
     let msg: Value = serde_json::from_str(&rx.try_recv().expect("local missed notification")).unwrap();
     assert_eq!(msg["method"], "missed");
     assert_eq!(msg["params"]["seq"], 7);
@@ -283,7 +387,7 @@ fn remote_misses_and_renames_keep_subscribers_on_the_current_machine() {
     assert_eq!(removed["params"]["type"], "removed");
     assert_eq!(created["params"]["terminal"], "renamed/t1");
     assert_eq!(created["params"]["data"]["status"]["state"], "working");
-    mirror_events(&core, &machine, &line, b"{\"method\":\"event\",\"params\":{\"type\":\"status\",\"terminal\":\"t1\",\"data\":{\"status\":{\"state\":\"blocked\"}}}}\n");
+    mirror_events(&core, &machine, &line, b"{\"method\":\"event\",\"params\":{\"type\":\"status\",\"terminal\":\"t1\",\"data\":{\"status\":{\"state\":\"blocked\"}}}}\n").unwrap();
     let status: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
     assert_eq!(status["params"]["terminal"], "renamed/t1");
     assert_eq!(core.lock().mirrors[&machine.id]["renamed/t1"]["status"]["state"], "blocked");

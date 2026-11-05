@@ -64,6 +64,17 @@ esac
 curl -fsSL "$download" -o "$tmp/hc.tar.gz" || fail "download failed: $url"
 [ "$(sha256 "$tmp/hc.tar.gz")" = "$want" ] || fail "the download is damaged (checksum mismatch); try again"
 tar -xzf "$tmp/hc.tar.gz" -C "$tmp"
+# Verify every downloaded macOS executable before even asking its version.
+# A checksum from the same release service does not establish its signer.
+if [ "$os" = macos ]; then
+  case "$releases" in
+    https://releases.herdr.dev | https://releases.herdr.dev/)
+      for signed in "$tmp/herdr-core" "$tmp/Herdr Core.app"; do
+        [ -e "$signed" ] || continue
+        /usr/bin/codesign --verify --strict -R '=identifier "dev.herdr.core" and anchor apple generic and certificate leaf[subject.OU] = "2W9652Q7QR"' "$signed" || fail "not a signed Herdr release"
+      done ;;
+  esac
+fi
 "$tmp/herdr-core" --version >/dev/null 2>&1 || fail "the downloaded hc does not run on this machine"
 # App completion must converge even before the first bundled release exists.
 if [ "${HC_BUNDLE_ONLY:-0}" = 1 ] && [ ! -x "$tmp/Herdr Core.app/Contents/MacOS/herdr-core" ]; then
@@ -88,10 +99,6 @@ if [ "$bundle" = 1 ] && [ -x "$tmp/Herdr Core.app/Contents/MacOS/herdr-core" ]; 
       for (i=1; i<=3; i++) { if (a[i]+0 > b[i]+0) exit 1; if (a[i]+0 < b[i]+0) exit 0 }
     }' || fail "$candidate is older than $installed; use hc update --from with --force to downgrade"
   fi
-  case "$releases" in
-    https://releases.herdr.dev | https://releases.herdr.dev/)
-      /usr/bin/codesign --verify --strict -R '=identifier "dev.herdr.core" and anchor apple generic and certificate leaf[subject.OU] = "2W9652Q7QR"' "$tmp/Herdr Core.app" || fail "not a signed Herdr release" ;;
-  esac
   "$bundled" --hc-install-bundle "$bundled" "$bin/herdr-core" || fail "installing Herdr Core.app failed"
   # A fresh install must not start a core (especially not a system/root core).
   if [ "$action" = updated ]; then
