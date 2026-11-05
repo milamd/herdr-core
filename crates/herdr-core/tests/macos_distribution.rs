@@ -60,6 +60,60 @@ fn script(s: &Scratch, name: &str, args: impl IntoIterator<Item = impl AsRef<OsS
     cmd
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn installer_rejects_unsigned_releases_before_running_any_downloaded_code() {
+    for bundle in [false, true] {
+        let s = Scratch::new();
+        let payload = s.root.join("payload");
+        std::fs::create_dir(&payload).unwrap();
+        let mut executables = vec![payload.join("herdr-core")];
+        if bundle {
+            let dir = payload.join("Herdr Core.app/Contents/MacOS");
+            std::fs::create_dir_all(&dir).unwrap();
+            executables.push(dir.join("herdr-core"));
+        }
+        for executable in executables {
+            std::fs::write(&executable, "#!/bin/sh\necho payload >> \"$CALLS\"\necho 'hc 9.9.9'\n").unwrap();
+            std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let archive = s.root.join("release.tar.gz");
+        assert!(
+            Command::new("tar").arg("-czf").arg(&archive).arg("-C").arg(&payload).arg(".").status().unwrap().success()
+        );
+        let hash = Command::new("shasum").args(["-a", "256"]).arg(&archive).output().unwrap();
+        assert!(hash.status.success());
+        let hash = String::from_utf8(hash.stdout).unwrap().split_whitespace().next().unwrap().to_string();
+        let target = format!("macos-{}", std::env::consts::ARCH);
+        let manifest = serde_json::json!({"version": "9.9.9", "targets": {target: {
+            "url": "https://releases.herdr.dev/fixture.tar.gz", "sha256": hash
+        }}});
+        std::fs::write(s.root.join("manifest.json"), manifest.to_string()).unwrap();
+        stub(
+            &s,
+            "curl",
+            "while [ $# -gt 0 ]; do case $1 in -o) shift; out=$1 ;; *latest.json) src=$HC_TEST_MANIFEST ;; *fixture.tar.gz*) src=$HC_TEST_ARCHIVE ;; esac; shift; done\ncp \"$src\" \"$out\"",
+        );
+        let out = Command::new("sh")
+            .arg(format!("{ROOT}/distribution/install.sh"))
+            .env("PATH", format!("{}:/usr/bin:/bin", s.root.join("tools").display()))
+            .env("CALLS", s.root.join("calls"))
+            .env("HC_TEST_MANIFEST", s.root.join("manifest.json"))
+            .env("HC_TEST_ARCHIVE", &archive)
+            .env("HC_INSTALL_DIR", s.root.join("bin"))
+            .env_remove("HERDR_RELEASES_URL")
+            .env_remove("HC_VERSION")
+            .env_remove("HC_BUNDLE_ONLY")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "unsigned release accepted: {out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not a signed Herdr release"), "{out:?}");
+        let calls = std::fs::read_to_string(s.root.join("calls")).unwrap();
+        assert!(!calls.lines().any(|line| line == "payload"), "downloaded code ran before verification: {calls}");
+        assert!(!s.root.join("bin").exists(), "signature rejection must happen before installation");
+    }
+}
+
 #[test]
 fn mac_sign_uses_runtime_and_entitlements_even_for_ad_hoc_builds() {
     let s = Scratch::new();

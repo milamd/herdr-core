@@ -52,6 +52,12 @@ Core does not add another encryption layer or authenticate a remote user itself.
 
 Adding a machine gives local clients access to its hc account's commands, files, and terminals.
 Trust the destination, the SSH target, and any custom connection command.
+Callbacks from a destination are limited to send, get, read, wait, and notes for local
+terminals that delegated work there. The local request determines that access;
+a remote response cannot nominate another local parent. An explicit remote parent
+or `--no-parent` does not grant access to the local caller.
+Remote event lines are limited to 16 MiB, including their newline. A larger line
+disconnects the remote connection; core then attempts to reconnect.
 Machine installation or update copies executable code there and restarts that session's core.
 Forgetting a machine removes the connection here, not its remote programs or state.
 See [machines](machines.md).
@@ -95,6 +101,11 @@ Release installers and updates download a manifest and check the archive's SHA-2
 The default release service is HTTPS at releases.herdr.dev.
 This trusts the release service and HTTPS; a checksum is not an independently signed release manifest.
 The manifest is not verified with a separate signing key.
+
+On macOS, the Unix installer verifies the standalone executable and any bundled app
+from the default release service against Herdr's signing identity before running
+downloaded code, including version probes. A custom `HERDR_RELEASES_URL` uses its
+manifest and checksum without that signing-identity check.
 
 Windows release signing is conditional in the release workflow.
 When the signing profile is configured, the workflow signs and verifies the executable with Azure Artifact Signing.

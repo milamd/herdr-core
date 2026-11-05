@@ -171,6 +171,12 @@ remote files and commands. `hc machine ls` lists configured machines; see
 Without `--name`, SSH machines use the first host label (IPs stay whole),
 shortened to 32 characters with `-2`, `-3`, etc. added if the name is taken.
 
+A remote child can send, get, read, wait, and report notes back to its local
+parent. The local run request determines callback access; the remote reply
+cannot choose another local parent. `--no-parent` or an explicit parent on
+the remote machine grants no callback access to the local caller.
+Remote event lines over 16 MiB disconnect the connection, which core redials.
+
 On Windows, `hc server status` never starts a core. If elevated SSH startup
 would block the same user's desktop session, open Herdr on that Windows
 machine or run `hc server start` in a normal desktop terminal, then reconnect.
