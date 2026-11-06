@@ -1,0 +1,75 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2870
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica-Light;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\pard\tx560\tx1120\tx1680\tx2240\tx2800\tx3360\tx3920\tx4480\tx5040\tx5600\tx6160\tx6720\pardirnatural\partightenfactor0
+
+\f0\fs22 \cf0 Rust CLI toolkit for streaming AWS log analysis\
+Revised planning document\
+\
+Build a thin toolkit for AWS retrieval, bounded analysis and evidence-backed reports. Start with existing command-line tools; add Rust processing only where benchmarks establish a useful advantage.\
+\
+Adam Drake\'92s article strengthens this approach: its improvements came from streaming, eliminating unnecessary sorting, combining filtering with aggregation, and parallelizing independent inputs before reducing partial results. Its historical \'93235\'d7\'94 comparison is workload-specific, not a performance target for this toolkit.\
+https://adamdrake.com/command-line-tools-can-be-235x-faster-than-your-hadoop-cluster.html\
+\
+1. Establish the baseline before building\
+\
+Create reproducible pipelines using AWS CLI or s5cmd for retrieval, and ripgrep plus awk/mawk or angle-grinder for analysis. Retain these as reference implementations.\
+\
+Use modern-unix to identify reusable components:\
+https://github.com/ibraheemdev/modern-unix\
+\
+\'95 ripgrep / grep-searcher: search baseline and reusable Rust search implementation.\
+\'95 jq / choose: structured-output interoperability.\
+\'95 hyperfine: local benchmarks.\
+\'95 fd / fzf / bat: optional discovery and inspection.\
+\
+Also evaluate angle-grinder for streaming aggregation and s5cmd for concurrent S3 downloads. Avoid introducing a query language or viewer.\
+https://github.com/rcoh/angle-grinder\
+https://github.com/peak/s5cmd\
+\
+2. Stream through a single analysis pass\
+\
+Proposed processing path:\
+AWS retrieval \uc0\u8594  incremental decompression \u8594  record framing \u8594  filter, extract and aggregate \u8594  report\
+\
+Analyze while downloading; make saving the complete input optional. Preserve source identifiers and positions whether input is saved or streamed.\
+\
+Fuse inexpensive filtering, field extraction and counters inside each worker. Compile matchers once and avoid per-record task creation, repeated parsing and unnecessary allocations. Keep commands composable at the CLI boundary without requiring a subprocess for every internal stage.\
+\
+Use counters for fixed categories. For message grouping, bound cardinality: spill exact aggregates to disk or explicitly label approximate heavy-hitter results. Sorting is reserved for bounded final results or external sorting when required.\
+\
+3. Parallelize the measured bottleneck\
+\
+Begin with one streaming worker, then distinguish three opportunities:\
+\
+\'95 Pipeline overlap: download, decompress and analyze concurrently.\
+\'95 Independent-source concurrency: fetch separate CloudWatch streams or S3 objects concurrently, with request limits and backoff.\
+\'95 CPU parallelism: process complete record batches using worker-local aggregates, then merge compact results.\
+\
+Use Tokio for asynchronous retrieval and introduce Rayon when CPU profiling justifies it. Expose separate limits for network concurrency, CPU workers and buffered bytes.\
+\
+CloudWatch pagination within a stream remains sequential; use a fixed end time and correct token termination. Do not partition gzip files into arbitrary byte ranges.\
+https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_GetLogEvents.html\
+\
+Preserve per-stream ordering for multiline records and sequence analysis. Counts and histograms can merge independently; averages require sums and counts, while percentiles require an appropriate mergeable representation.\
+\
+4. Produce compact, verifiable reports\
+\
+Initial reports cover counts, frequent messages, retries, time-bucketed activity and CI test summaries. Include representative examples with source references.\
+\
+Explicitly distinguish events, matching lines and occurrences; expose case-sensitivity rules. Report malformed records, incomplete downloads and approximation limits. Error-word matches must not become failure diagnoses.\
+\
+Provide JSON/JSONL and readable text, with progress on stderr. Defer LLM summaries.\
+\
+5. Deliver through benchmark gates\
+\
+1. Baseline: existing-tool pipelines and correctness fixtures.\
+2. Retrieval: resumable AWS downloads, provenance and bounded streaming.\
+3. Analysis: implement only capabilities the existing pipelines cannot adequately supply.\
+4. Optimization: retain concurrency and custom Rust kernels only when they improve measured outcomes.\
+\
+Benchmark the pilot log and representative 100 MB\'96multi-GB inputs. Measure read-to-null throughput, decompression, local analysis and complete AWS retrieval separately. Record warm/cold cache conditions, peak memory, time to first result, throughput and request counts.\
+\
+Acceptance requires identical results across worker settings, bounded memory, correct boundary handling and recoverable interruption. Treat the earlier 512 MiB budget as provisional. Success is a reproducible improvement over a simple streaming baseline\'97not a particular language, thread count or headline speedup.\
+}
