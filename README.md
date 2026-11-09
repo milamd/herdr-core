@@ -1,29 +1,44 @@
 # herdr-core (`hc`)
 
+This is [milamd/herdr-core](https://github.com/milamd/herdr-core), a fork of
+[herdrdev/herdr-core](https://github.com/herdrdev/herdr-core).
+
 `hc` runs programs and coding agents in terminals that stay alive after you leave.
 Agents can start other agents, send them work, and hear back; you can attach to any terminal and take over.
 
 Core draws nothing. Use it from your shell, an agent, or your own app.
 
-## Install
+## Install from source
 
-Linux and macOS:
+Build this fork from its source. You need Git, Rust (CI pins 1.95.0), Zig 0.16.0,
+just, and a C linker/toolchain for your OS. On Windows, use the MSVC toolchain;
+templates and quoted shell commands also need `sh` on PATH, such as Git for Windows provides.
 
 ```sh
-curl -fsSL https://releases.herdr.dev/core/install.sh | sh
+git clone https://github.com/milamd/herdr-core.git
+cd herdr-core
+git submodule update --init --depth 1
+cargo build --locked -p herdr-core
 ```
 
-Windows (PowerShell):
+This builds `target/debug/herdr-core` (`target/debug/herdr-core.exe` on Windows).
+To build and install a release binary from this checkout:
 
-```powershell
-powershell -c "irm https://releases.herdr.dev/core/install.ps1 | iex"
+```sh
+just install
+hc --help
 ```
 
-Builds are available for Linux and macOS on x86_64 and aarch64, and Windows on x86_64.
-Linux builds are static. On Windows, templates and quoted shell commands need `sh` on PATH, such as Git for Windows provides.
+On Linux and macOS, the default install directory is `~/.local/bin`; add it to
+PATH if needed. On Windows, it is `%LOCALAPPDATA%\Programs\herdr-core`, which the
+installer adds to your user PATH; open a new shell afterward. The Windows install
+also fetches the pinned Microsoft ConPTY runtime. Set `HC_INSTALL_DIR` to override
+the install directory.
 
-Run `hc update` to update. Running terminals keep running.
-See [security](docs/security.md) for the trust and signing details.
+`just install` replaces the installed binary and restarts core, keeping running
+terminals alive. To update this fork, pull the desired changes, update the
+submodule, and rerun `just install`. The built-in `hc update` uses upstream's
+release service by default and can replace this fork with an upstream build.
 
 ## Run it and come back
 
@@ -102,6 +117,9 @@ hc attach box/t3
 Use the address returned by your run, not the example's `box/t3`.
 Programs and files stay on that machine. Your local core brings its terminals into the same list.
 [Machines](docs/machines.md) covers SSH, custom connections, remote files, and reconnecting.
+Remote installation can download upstream releases, including for Windows and
+when the remote OS or CPU differs from yours. To keep this fork on a remote
+machine, build and install it there before adding it.
 
 ## Status comes from the program
 
@@ -128,20 +146,12 @@ Use `hc connect` to carry the protocol over stdin and stdout, including through 
 For a quick lookup, run `hc --help` or a command's help, such as `hc run --help`.
 For agents, use `hc --skill`.
 
-## Build from source
+## Development
 
-You need Rust, Zig 0.16, and just. CI pins the Rust version in [.github/workflows/ci.yml](.github/workflows/ci.yml).
-
-```sh
-git submodule update --init --depth 1
-cargo build --locked -p herdr-core
-just check
-```
-
-`just install` installs this checkout and restarts your core. Running terminals keep running.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contributor setup and check prerequisites,
+and [.github/workflows/ci.yml](.github/workflows/ci.yml) for pinned CI toolchains.
+`just check` runs formatting, dependency checks, clippy, and the test suite.
 `just docs` refreshes the command reference. `just docs-check` checks it and the examples; CI runs the same tests.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contributor setup and checks.
 
 License: [Apache-2.0](LICENSE). `hc --licenses` prints the included third-party licenses.
 After a dependency change, regenerate them with `just notices`.
