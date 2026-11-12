@@ -14,75 +14,6 @@ fn hc(s: &Session, args: &[&str]) -> (i32, String) {
 }
 
 #[test]
-fn bare_core_commands_work_without_hc_on_path() {
-    let mut s = Session::new();
-    s.env.push(("PATH".into(), s.root.join("empty-path").display().to_string()));
-    for program in ["hc", "herdr-core"] {
-        let result = s.json(&["run", program, "--version"]);
-        assert_eq!(result["wait"]["exit_code"], 0, "{result}");
-        assert_eq!(result["output"].as_str().unwrap().trim(), format!("hc {}", env!("CARGO_PKG_VERSION")));
-    }
-}
-
-#[test]
-fn hc_fallback_preserves_path_choices_and_spawn_errors() {
-    use serde_json::json;
-    use std::os::unix::fs::PermissionsExt;
-
-    let s = Session::new();
-    let bin = s.root.join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    let shadow = bin.join("hc");
-    std::fs::write(&shadow, "#!/bin/sh\nprintf 'chosen-on-path\\n'\n").unwrap();
-    std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o755)).unwrap();
-    s.json(&["server", "start"]);
-    let mut conn = s.connect();
-    for path in [bin.display().to_string(), "bin".into(), "".into()] {
-        let cwd = if path.is_empty() { &bin } else { &s.root };
-        let reply = conn.call(
-            1,
-            "terminal.run",
-            json!({
-                "argv": ["hc", "--version"], "env": {"PATH": path}, "cwd": cwd, "wait": true
-            }),
-        );
-        assert_eq!(reply["result"]["output"].as_str().unwrap().trim(), "chosen-on-path", "{reply}");
-    }
-    for program in ["./hc", "/no-such-directory/hc", "hc.exe", "HC", "no-such-program"] {
-        let reply = conn.call(
-            2,
-            "terminal.run",
-            json!({
-                "argv": [program, "--version"], "env": {"PATH": "/no-such-directory"},
-                "cwd": s.root, "wait": true
-            }),
-        );
-        assert_eq!(reply["error"]["data"]["kind"], "spawn_failed", "{reply}");
-    }
-    let reply = conn.call(
-        3,
-        "terminal.run",
-        json!({
-            "argv": ["hc", "--version"], "env": {"PATH": "/no-such-directory"},
-            "cwd": s.root.join("missing"), "wait": true
-        }),
-    );
-    assert_eq!(reply["error"]["data"]["kind"], "spawn_failed", "{reply}");
-    for mode in [0o755, 0o644] {
-        std::fs::write(&shadow, "#!/no-such-interpreter\n").unwrap();
-        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(mode)).unwrap();
-        let reply = conn.call(
-            4,
-            "terminal.run",
-            json!({
-                "argv": ["hc", "--version"], "env": {"PATH": bin}, "wait": true
-            }),
-        );
-        assert_eq!(reply["error"]["data"]["kind"], "spawn_failed", "{reply}");
-    }
-}
-
-#[test]
 fn initial_size_is_optional_and_applies_before_the_program_starts() {
     use serde_json::{Value, json};
     let s = Session::new();
@@ -114,6 +45,38 @@ fn initial_display_answers_the_programs_first_color_query() {
     let params = json!({"argv": ["sh", "-c", probe], "wait": true, "display": {"bg": "#fbfcfb"}});
     let reply = conn.call(1, "terminal.run", params);
     assert!(reply["result"]["output"].as_str().unwrap().contains("fbfb/fcfc/fbfb"), "{reply}");
+}
+
+#[test]
+fn callers_use_the_cores_terminal_identity() {
+    let mut s = Session::new();
+    s.env.extend(
+        [("TERM", "dumb"), ("COLORTERM", ""), ("TERM_PROGRAM", "agent"), ("TERM_PROGRAM_VERSION", "1")]
+            .map(|(k, v)| (k.into(), v.into())),
+    );
+    let probe =
+        r#"sh -c 'printf "identity=%s:%s:%s:%s\n" "$TERM" "$COLORTERM" "$TERM_PROGRAM" "${TERM_PROGRAM_VERSION-}"'"#;
+    let (code, out) = hc(&s, &["run", probe]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("identity=xterm-256color:truecolor:ghostty:"), "{out:?}");
+
+    // The outer pane supplies a real PTY to the nested CLI.
+    let command =
+        format!("TERM=xterm-kitty COLORTERM=24bit TERM_PROGRAM=kitty TERM_PROGRAM_VERSION=0.40 {BIN} run {probe}");
+    let (code, out) = hc(&s, &["run", "sh", "-c", &command]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("identity=xterm-256color:truecolor:ghostty:"), "{out:?}");
+
+    let reply = s.connect().call(
+        1,
+        "terminal.run",
+        serde_json::json!({
+            "argv": ["sh", "-c", "printf '%s:%s:%s:%s' \"$TERM\" \"$COLORTERM\" \"$TERM_PROGRAM\" \"$TERM_PROGRAM_VERSION\""],
+            "env": {"TERM": "vt100", "COLORTERM": "24bit", "TERM_PROGRAM": "client", "TERM_PROGRAM_VERSION": "2"},
+            "wait": true
+        }),
+    );
+    assert_eq!(reply["result"]["output"].as_str().unwrap().trim(), "vt100:24bit:client:2", "{reply}");
 }
 
 #[test]

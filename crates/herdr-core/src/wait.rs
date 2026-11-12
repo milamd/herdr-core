@@ -54,6 +54,20 @@ fn stuck(word: Option<&str>) -> bool {
     matches!(word, Some("blocked" | "error"))
 }
 
+/// The text of a chunk of output after what the last one `held`: a character
+/// cut at the chunk's end waits there for the rest instead of becoming U+FFFD.
+fn text_of(held: &mut Vec<u8>, bytes: &[u8]) -> String {
+    held.extend_from_slice(bytes);
+    // Only a start that more bytes could still make valid; anything else is U+FFFD now.
+    let open =
+        |at: usize| std::str::from_utf8(&held[at..]).is_err_and(|e| e.valid_up_to() == 0 && e.error_len().is_none());
+    let at = (held.len().saturating_sub(3)..held.len()).find(|at| open(*at)).unwrap_or(held.len());
+    let rest = held.split_off(at);
+    let text = strip(held);
+    *held = rest;
+    text
+}
+
 /// Output without escape sequences, for matching what a person would read.
 fn strip(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
@@ -85,6 +99,27 @@ fn strip(bytes: &[u8]) -> String {
     out
 }
 
+/// A wait's subscription and output watch, gone with it however it returns.
+struct Registered<'a> {
+    core: &'a Core,
+    id: u32,
+    events: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+    output: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        let mut st = self.core.lock();
+        self.core.unsubscribe_waiter(&mut st, &self.events);
+        if let Some(watchers) = st.output_watch.get_mut(&self.id) {
+            watchers.retain(|w| !w.same_channel(&self.output));
+            if watchers.is_empty() {
+                st.output_watch.remove(&self.id);
+            }
+        }
+    }
+}
+
 impl Core {
     /// A wait's answer from the terminal's current facts; `word` overrides its status.
     pub fn wait_result(&self, id: u32, ended: bool, reason: &str, word: Option<Option<String>>) -> WaitResult {
@@ -113,13 +148,14 @@ impl Core {
             self.subscribe(
                 &mut st,
                 Filter { terminal: Some(crate::terminals::address(id)), ..Default::default() },
-                Sink::Waiter(tx),
+                Sink::Waiter(tx.clone()),
             );
             if spec.output.is_some() {
-                st.output_watch.entry(id).or_default().push(out_tx);
+                st.output_watch.entry(id).or_default().push(out_tx.clone());
             }
             st.reg.terminals.get(&id).cloned()
         };
+        let _registered = Registered { core: self, id, events: tx, output: out_tx };
         let result =
             |ended: bool, reason: &str, word: Option<Option<String>>| self.wait_result(id, ended, reason, word);
         let Some(start) = start.filter(|t| t.is_live() && !t.program_lost()) else {
@@ -141,6 +177,7 @@ impl Core {
         let deadline = tokio::time::Instant::now() + spec.timeout;
         let mut prev = start.status.map(|s| s.state);
         let mut seen = String::new();
+        let mut held = Vec::new();
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -174,7 +211,7 @@ impl Core {
                     }
                 }
                 Some(bytes) = output.recv() => {
-                    seen.push_str(&strip(&bytes));
+                    seen.push_str(&text_of(&mut held, &bytes));
                     if spec.output.as_deref().is_some_and(|needle| seen.contains(needle)) {
                         return result(true, "output", None);
                     }
@@ -209,5 +246,23 @@ mod tests {
     #[test]
     fn output_is_matched_without_escape_sequences() {
         assert_eq!(strip(b"\x1b[31mRE\x1b[0mADY\x1b]2;t\x07!\r\n"), "READY!\n");
+    }
+
+    #[test]
+    fn a_character_cut_between_chunks_is_matched_whole() {
+        let out = "é 준비 ✓ 완료 🚀\n".as_bytes();
+        for cut in 0..=out.len() {
+            let mut held = Vec::new();
+            let text = text_of(&mut held, &out[..cut]) + &text_of(&mut held, &out[cut..]);
+            assert_eq!(text, "é 준비 ✓ 완료 🚀\n", "cut at byte {cut}");
+            assert!(held.is_empty());
+        }
+        let mut held = Vec::new();
+        let text: String = out.iter().map(|b| text_of(&mut held, &[*b])).collect();
+        assert_eq!(text, "é 준비 ✓ 완료 🚀\n", "one byte at a time");
+        for bad in [&b"a\xc0"[..], b"a\xe0\x80", b"a\xf4\x90"] {
+            assert_eq!(text_of(&mut held, bad), String::from_utf8_lossy(bad), "{bad:?} can never become a character");
+            assert!(held.is_empty());
+        }
     }
 }

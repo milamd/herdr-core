@@ -163,7 +163,7 @@ fn runs_a_program_and_keeps_its_result_after_exit() {
 }
 
 #[test]
-fn child_gets_core_env_caller_identity_cwd_and_its_own_address() {
+fn child_gets_core_env_terminal_identity_cwd_and_its_own_address() {
     let s = Session::new();
     s.json(&["server", "start"]);
     let out = s
@@ -176,7 +176,7 @@ fn child_gets_core_env_caller_identity_cwd_and_its_own_address() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    wait_text(&s, "t1", "id=t1 foo= tp=WezTerm pwd=/var/tmp");
+    wait_text(&s, "t1", "id=t1 foo= tp=ghostty pwd=/var/tmp");
 
     // Never herdr: a program started from inside Herdr sees plain ghostty.
     let out = s
@@ -305,8 +305,9 @@ fn planned_restart_restores_the_exact_screen() {
     let pid = get(&s, &t)["pid"].clone();
     let old = status(&s)["pid"].as_i64().unwrap();
     let new = s.json(&["server", "restart"])["pid"].as_i64().unwrap();
-    assert!(!pid_alive(old) && new != old);
-    std::thread::sleep(Duration::from_millis(700));
+    assert_ne!(new, old);
+    wait_until("old core exit", || !pid_alive(old));
+    wait_text(&s, &t, "three");
 
     let rec = get(&s, &t);
     assert_eq!((rec["state"].as_str(), rec["screen"].as_str()), (Some("live"), Some("exact")));
@@ -315,22 +316,46 @@ fn planned_restart_restores_the_exact_screen() {
     assert!(text.contains("one\ntwo\nthree"), "{text:?}");
     assert_eq!(text.matches("one").count(), 1, "replayed twice: {text:?}");
 
-    // An unsavable handoff refuses SIGTERM without losing the core or its screen.
+    // A service-manager stop must still hand over even when environment saving is impossible.
     let blocked = s.root.join("state/herdr-core/test/restart-env.json");
     std::fs::create_dir(&blocked).unwrap();
     unsafe { libc::kill(new as i32, libc::SIGTERM) };
-    wait_until("SIGTERM handoff refused", || {
-        std::fs::read_to_string(s.root.join("state/herdr-core/test/core.log"))
-            .is_ok_and(|log| log.contains("core: cannot restart:"))
-    });
-    assert_eq!(status(&s)["pid"].as_i64(), Some(new));
-    assert_eq!(get(&s, &t)["screen"], "exact");
-    std::fs::remove_dir(blocked).unwrap();
-
-    // SIGTERM (e.g. a service manager) can be retried after the failure.
-    unsafe { libc::kill(new as i32, libc::SIGTERM) };
     wait_until("core exit", || !pid_alive(new));
     assert_eq!(get(&s, &t)["screen"], "exact");
+    std::fs::remove_dir(blocked).unwrap();
+}
+
+#[test]
+fn restarting_waits_for_the_old_cores_lock_after_its_connection_closes() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    let s = Session::new();
+    let state = s.root.join("state/herdr-core/test");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(s.socket().parent().unwrap()).unwrap();
+    let lock = std::fs::File::create(state.join("core.lock")).unwrap();
+    assert!(herdr_core::platform::try_lock(&lock));
+    let listener = UnixListener::bind(s.socket()).unwrap();
+    let socket = s.socket();
+    let old = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "server.restart");
+        writeln!(stream, "{}", serde_json::json!({"id": 1, "result": {"stopped": true}})).unwrap();
+        drop(listener);
+        std::fs::remove_file(socket).unwrap();
+        drop(stream);
+        // Runtime teardown closes clients before serve's lock is dropped.
+        std::thread::sleep(Duration::from_millis(400));
+        drop(lock);
+    });
+    let out = s.hc(&["server", "restart"]);
+    old.join().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(s.json(&["server", "status"])["pid"].as_u64().is_some());
 }
 
 #[test]
@@ -541,6 +566,33 @@ fn a_replaced_cores_late_goodbye_does_not_end_the_new_one() {
         assert_eq!(proto::read(&mut new).unwrap().unwrap().0, proto::WELCOME);
         assert!(proto::read(&mut new).is_err(), "nothing after the welcome, no goodbye");
     }
+}
+
+#[test]
+fn a_draining_holder_keeps_its_programs_and_refuses_new_work_after_reconnect() {
+    let s = Session::new();
+    let (_holder, socket) = raw_holder(&s, "draining");
+    let (mut core, welcome) = raw_hello(&socket);
+    assert!(!welcome.draining);
+    raw_spawn(&mut core, 1, &["sleep", "100"]);
+    let (kind, id, payload) = proto::read(&mut core).unwrap().unwrap();
+    assert_eq!((kind, id), (proto::SPAWNED, 1));
+    let pid = proto::parse::<proto::Spawned>(&payload).unwrap().pid as i64;
+    raw_send(&mut core, proto::frame(proto::DRAIN, 0, &[]));
+    raw_send(&mut core, proto::frame(proto::FOREGROUND, 1, &[]));
+    assert_eq!(proto::read(&mut core).unwrap().unwrap().0, proto::FOREGROUND_IS);
+
+    let (mut next, welcome) = raw_hello(&socket);
+    assert!(welcome.draining);
+    assert_eq!(welcome.terminals[0].pid as i64, pid);
+    assert_eq!(proto::read(&mut next).unwrap().unwrap().0, proto::TAIL);
+    raw_spawn(&mut next, 2, &["sleep", "100"]);
+    let (kind, id, payload) = proto::read(&mut next).unwrap().unwrap();
+    assert_eq!((kind, id), (proto::SPAWN_FAILED, 2));
+    assert!(proto::parse::<proto::SpawnFailed>(&payload).unwrap().error.contains("draining"));
+    assert!(pid_alive(pid));
+    raw_send(&mut next, proto::json_frame(proto::GOODBYE, 0, &proto::Goodbye::Shutdown));
+    assert_eq!(proto::read(&mut next).unwrap().unwrap().0, proto::BYE);
 }
 
 /// A holder on its own, driven by the test as its core; killed when dropped.

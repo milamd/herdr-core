@@ -39,10 +39,9 @@ pub fn about(pid: i32) -> Option<Foreground> {
     use std::mem::{MaybeUninit, size_of};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
-    use windows_sys::Win32::Foundation::{HANDLE, LocalFree, UNICODE_STRING};
+    use windows_sys::Win32::Foundation::{HANDLE, UNICODE_STRING};
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::*;
-    use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
     let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid as u32) };
     if raw.is_null() {
@@ -85,20 +84,11 @@ pub fn about(pid: i32) -> Option<Foreground> {
     let image = String::from_utf16(&text(params.ImagePathName)?).ok()?;
     let name = image.rsplit('\\').next().unwrap_or(&image).to_string();
 
-    let mut line = text(params.CommandLine)?;
-    line.push(0);
-    let mut argc = 0;
-    let list = unsafe { CommandLineToArgvW(line.as_ptr(), &mut argc) };
-    if list.is_null() {
-        return None;
-    }
-    let argv = (0..argc as usize)
-        .map(|i| unsafe {
-            let arg = *list.add(i);
-            String::from_utf16_lossy(std::slice::from_raw_parts(arg, (0..).take_while(|&n| *arg.add(n) != 0).count()))
-        })
+    let argv = crate::platform::split_command_line(text(params.CommandLine)?)
+        .ok()?
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    unsafe { LocalFree(list.cast()) };
     Some(Foreground { pid, name, argv, cwd })
 }
 
@@ -150,6 +140,21 @@ pub fn procargs(pid: i32) -> Option<(Vec<String>, Vec<u8>)> {
     Some((argv, rest.to_vec()))
 }
 
+fn shell_root(root: &Foreground) -> bool {
+    // Command and script wrappers can share their foreground group with a live agent.
+    if root.argv.iter().skip(1).any(|arg| {
+        (!arg.starts_with('-') && !arg.starts_with('+'))
+            || matches!(arg.split('=').next(), Some("--command" | "--commands"))
+            || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('c'))
+    }) {
+        return false;
+    }
+    let program =
+        if root.name.is_empty() { root.argv.first().map(String::as_str).unwrap_or_default() } else { &root.name };
+    let name = program.rsplit('/').next().unwrap_or(program);
+    matches!(name, "sh" | "bash" | "zsh" | "fish" | "nu" | "dash" | "ksh" | "tcsh")
+}
+
 impl Core {
     /// Keeps every live terminal's `foreground` current, with an event on each change.
     pub async fn watch_foreground(self: Arc<Self>) {
@@ -161,15 +166,50 @@ impl Core {
                 let pgid = self.foreground(id).await;
                 let now = (pgid > 0).then(|| about(pgid)).flatten();
                 let mut st = self.lock();
-                let Some(t) = st.reg.terminals.get_mut(&id).filter(|t| t.is_live() && t.foreground != now) else {
+                let Some(t) = st.reg.terminals.get_mut(&id).filter(|t| t.is_live()) else {
                     continue;
                 };
+                let at_shell = crate::platform::foreground_tracks_jobs()
+                    && now.as_ref().is_some_and(|n| Some(n.pid as u32) == t.pid && shell_root(n));
+                let change = (at_shell && (t.status.is_some() || !t.records.is_empty())).then(|| {
+                    t.first_task_turn = None;
+                    crate::status::reset(t)
+                });
+                let foreground_changed = t.foreground != now;
                 if let Some(f) = &now {
                     t.last_cwd = Some(f.cwd.clone());
                 }
                 t.foreground = now.clone();
-                self.save_soon();
-                self.emit(&mut st, "foreground", id, serde_json::to_value(&now).unwrap_or_default());
+                if change.is_some() || foreground_changed {
+                    self.save_soon();
+                }
+                if let Some(change) = change {
+                    self.status_changed(&mut st, id, change);
+                }
+                if foreground_changed {
+                    self.emit(&mut st, "foreground", id, serde_json::to_value(&now).unwrap_or_default());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_flags_keep_shell_roots_from_clearing_live_status() {
+        for shell in ["sh", "bash", "zsh", "fish", "nu", "dash", "ksh", "tcsh"] {
+            let mut root = Foreground { pid: 1, name: shell.into(), argv: vec![shell.into()], cwd: "/".into() };
+            assert!(shell_root(&root), "{shell}");
+            for arg in ["-i", "-li", "--login", "--no-config"] {
+                root.argv = vec![shell.into(), arg.into()];
+                assert!(shell_root(&root), "{shell} {arg}");
+            }
+            for arg in ["-c", "-cecho", "-ic echo", "--command", "--command=echo", "--commands", "--commands=echo"] {
+                root.argv = vec![shell.into(), arg.into()];
+                assert!(!shell_root(&root), "{shell} {arg}");
             }
         }
     }

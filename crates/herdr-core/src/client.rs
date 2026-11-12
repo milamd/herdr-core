@@ -19,10 +19,6 @@ pub fn remember_exe() {
     build_id();
 }
 
-pub(crate) fn executable() -> std::io::Result<std::path::PathBuf> {
-    EXE.get().cloned().map_or_else(std::env::current_exe, Ok)
-}
-
 /// The package manager this hc came from, or "system package manager" as a
 /// compatibility marker when its folder isn't writable. None for a replaceable install.
 pub fn installed_by() -> Option<&'static str> {
@@ -99,6 +95,29 @@ fn connect_starting(paths: &Paths, explicit: bool) -> Result<Stream, RpcError> {
         return Err(err);
     }
     platform::may_autostart(explicit)?;
+    paths.create_dirs().map_err(|e| unavailable(format!("cannot start core: {e}")))?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(paths.state.join("core.lock"))
+        .map_err(|e| unavailable(format!("cannot open core lock: {e}")))?;
+    let start = Instant::now();
+    loop {
+        if let Ok(stream) = platform::connect(&paths.socket) {
+            return Ok(stream);
+        }
+        // A closing connection does not mean serve has released its lock yet.
+        // Starting its replacement early would make that process exit immediately.
+        if platform::try_lock(&lock) {
+            break;
+        }
+        if start.elapsed() > START_WAIT {
+            return Err(unavailable(format!("core did not stop or start within {} s", START_WAIT.as_secs())));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(lock);
     spawn_core(paths)?;
     wait_for_socket(&paths.socket, "core").map_err(unavailable)
 }
@@ -181,11 +200,11 @@ pub fn spawn_core(paths: &Paths) -> Result<(), RpcError> {
 pub fn spawn_detached(paths: &Paths, args: &[&str], log: &str) -> std::io::Result<()> {
     paths.create_dirs()?;
     let log = paths.state.join(log);
-    let exe = executable()?;
+    let exe = EXE.get().cloned().map_or_else(std::env::current_exe, Ok)?;
     let exe = if args.first() == Some(&"serve") { platform::core_executable(&exe) } else { exe };
     let mut cmd = Command::new(exe);
-    if args == ["serve"] {
-        crate::restart::apply(paths, &mut cmd)?;
+    if args.first() == Some(&"serve") {
+        platform::core_environment(&mut cmd, &paths.state);
     }
     // A core or holder started from inside a terminal is not that terminal's:
     // ending the terminal must not end them.

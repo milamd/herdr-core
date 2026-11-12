@@ -7,6 +7,20 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+pub fn check_via(_target: &str) -> io::Result<()> {
+    Ok(())
+}
+
+pub fn via_add_hint(target: &str) -> String {
+    format!("hc machine add --via '{}' --name <name>", target.replace('\'', r"'\''"))
+}
+
+pub fn via_command(target: &str, line: &str) -> io::Result<Command> {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(format!("{target} \"$1\"")).arg("sh").arg(line);
+    Ok(cmd)
+}
+
 // --- Connections -----------------------------------------------------------
 
 /// A connection to a core or a holder (blocking).
@@ -52,6 +66,24 @@ pub fn listen(path: &Path) -> io::Result<Listener> {
 
 pub type AsyncRead = tokio::net::unix::OwnedReadHalf;
 pub type AsyncWrite = tokio::net::unix::OwnedWriteHalf;
+
+/// Read EOF can be a caller's SHUT_WR: probe the reply side without sending bytes.
+pub async fn reply_closed(read: &AsyncRead) {
+    loop {
+        let result = unsafe {
+            libc::send(read.as_ref().as_raw_fd(), std::ptr::null(), 0, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+        };
+        if result < 0
+            && matches!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN)
+            )
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
 
 /// The core's socket for clients.
 pub struct AsyncListener(tokio::net::UnixListener);
@@ -171,6 +203,8 @@ mod nofile_tests {
 /// won't end it), stdin/stdout to /dev/null, stderr to `log`.
 pub fn spawn_detached(mut cmd: Command, log: std::fs::File) -> io::Result<()> {
     use std::process::Stdio;
+    #[cfg(target_os = "macos")]
+    cmd.env_remove("XPC_FLAGS");
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     unsafe {
         cmd.pre_exec(|| {
@@ -545,6 +579,41 @@ pub fn machine_id() -> Option<String> {
         .filter(|s| !s.is_empty() && s != "uninitialized")
 }
 
+/// Identity of this boot, not just the machine that owns the disk.
+pub fn boot_id() -> io::Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut bytes = [0u8; 128];
+        let mut size = bytes.len();
+        if unsafe {
+            libc::sysctlbyname(
+                c"kern.bootsessionuuid".as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let value = std::str::from_utf8(&bytes[..size]).map_err(io::Error::other)?.trim_end_matches('\0').trim();
+        if value.is_empty() {
+            return Err(io::Error::other("boot identity is empty"));
+        }
+        Ok(Some(value.into()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let value = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(io::Error::other("boot identity is empty"));
+        }
+        Ok(Some(value.into()))
+    }
+}
+
 // --- Terminals -------------------------------------------------------------
 
 /// A program on its own terminal.
@@ -613,34 +682,6 @@ impl Write for PtyIo {
 }
 
 pub type Process = Child;
-
-pub(crate) fn missing_core_command(program: &str, env: &std::collections::BTreeMap<String, String>, cwd: &str) -> bool {
-    use std::os::unix::ffi::OsStringExt;
-
-    if !matches!(program, "hc" | "herdr-core") {
-        return false;
-    }
-    let path = match env.get("PATH") {
-        Some(path) => std::ffi::OsString::from(path),
-        None => {
-            let len = unsafe { libc::confstr(libc::_CS_PATH, std::ptr::null_mut(), 0) };
-            if len == 0 {
-                return false;
-            }
-            let mut path = vec![0; len];
-            unsafe { libc::confstr(libc::_CS_PATH, path.as_mut_ptr().cast(), len) };
-            path.pop();
-            std::ffi::OsString::from_vec(path)
-        }
-    };
-    std::env::split_paths(&path).all(|dir| {
-        // Keep existing entries, even broken scripts/links, and permission errors.
-        matches!(
-            std::fs::symlink_metadata(Path::new(cwd).join(dir).join(program)),
-            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
-        )
-    })
-}
 
 /// Starts `argv` on a new terminal of `cols`x`rows`.
 pub fn spawn_pty(

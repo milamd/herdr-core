@@ -12,6 +12,32 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_herdr-core");
+
+#[test]
+fn via_runs_without_a_console_and_passes_the_remote_line_whole() {
+    let s = Session::new();
+    std::fs::create_dir_all(s.root.join("via dir")).unwrap();
+    let probe = s.file(
+        r"via dir\via.ps1",
+        r#"Add-Type 'using System; using System.Runtime.InteropServices; public static class ViaProbe {
+            [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); }'
+[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'console.txt'), [ViaProbe]::GetConsoleWindow().ToInt64().ToString())
+[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'line.txt'), [Environment]::GetCommandLineArgs()[-1])
+$request = [Console]::ReadLine() | ConvertFrom-Json
+if ($request.method -ne 'hello') { exit 2 }
+[Console]::WriteLine('{"id":1,"error":{"code":-32000,"message":"via-probe","data":{"kind":"probe","hint":"done"}}}')
+"#,
+    );
+    let via = format!("  powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{probe}\"");
+    let output = cmd(&s.name, &s.root).args(["machine", "add", "--via", &via, "--name", "box"]).output().unwrap();
+    let error: Value = serde_json::from_slice(&output.stderr)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stderr)));
+    assert_eq!(error["error"]["kind"], "probe", "{error}");
+    assert_eq!(std::fs::read_to_string(s.root.join("via dir/console.txt")).unwrap(), "0");
+    let line = std::fs::read_to_string(s.root.join("via dir/line.txt")).unwrap();
+    assert!(line.starts_with("sh -c 'p=$(command -v herdr-core)") && line.ends_with("exec \"$p\" connect'"), "{line}");
+}
+
 static LIVE: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
 
 struct Session {
@@ -93,38 +119,6 @@ impl Session {
         std::fs::write(&path, body).unwrap();
         path.display().to_string()
     }
-}
-
-#[test]
-fn bare_core_commands_fall_back_after_windows_path_and_pathext() {
-    let s = Session::new();
-    s.json(&["server", "start"]);
-    let (directory, prefix) = herdr_core::platform::endpoints(&s.root);
-    let stream = herdr_core::platform::connect(&directory.join(format!("{prefix}{}.sock", s.name))).unwrap();
-    let run = |program: &str, cwd: &Path| {
-        herdr_core::client::call(
-            &stream,
-            "terminal.run",
-            json!({
-                "argv": [program, "--version"], "cwd": cwd, "wait": true,
-                "env": {"pAtH": s.root, "pAtHeXt": ".CMD;.EXE"}
-            }),
-        )
-    };
-    for program in ["hc", "HeRdR-CoRe", "HC.EXE", "herdr-core.exe"] {
-        let result = run(program, &s.root).unwrap();
-        assert_eq!(result["wait"]["exit_code"], 0, "{result}");
-        assert_eq!(result["output"].as_str().unwrap().trim(), format!("hc {}", env!("CARGO_PKG_VERSION")));
-    }
-    s.file("hc.cmd", "@echo chosen-on-path\r\n");
-    let result = run("HC", &s.root).unwrap();
-    assert_eq!(result["output"].as_str().unwrap().trim(), "chosen-on-path", "{result}");
-    for program in [".\\hc.exe", "no-such-program"] {
-        assert_eq!(run(program, &s.root).unwrap_err().kind, "spawn_failed");
-    }
-    assert_eq!(run("herdr-core", &s.root.join("missing")).unwrap_err().kind, "spawn_failed");
-    s.file("hc.exe", "not an executable");
-    assert_eq!(run("hc.exe", &s.root).unwrap_err().kind, "spawn_failed");
 }
 
 impl Drop for Session {
@@ -683,6 +677,32 @@ fn planned_restarts_preserve_the_environment_for_new_terminals() {
 }
 
 #[test]
+fn fresh_restart_uses_the_callers_environment_and_keeps_running_programs() {
+    let s = Session::new();
+    let started = cmd(&s.name, &s.root)
+        .env("NO_COLOR", "1")
+        .env("HC_SESSION_VALUE", "dirty")
+        .args(["server", "start"])
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
+    let t = s.bg(&["powershell", "-NoProfile", "-Command", "Start-Sleep -Seconds 100"]);
+    let pid = s.json(&["get", &t])["pid"].clone();
+    let out = cmd(&s.name, &s.root)
+        .env_remove("NO_COLOR")
+        .env("HC_SESSION_VALUE", "fresh")
+        .args(["server", "restart", "--fresh"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(s.json(&["get", &t])["pid"], pid);
+    let probe = s.file("fresh.ps1", r#"Write-Output "ENV:$env:NO_COLOR|$env:HC_SESSION_VALUE""#);
+    let (code, out) = s.out(&["run", "--timeout", "15", "powershell", "-NoProfile", "-File", &probe]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("ENV:|fresh"), "{out}");
+}
+
+#[test]
 fn a_copied_disks_restart_environment_does_not_replace_the_new_machines() {
     let s = Session::new();
     let machine = herdr_core::platform::machine_id().expect("Windows machine ID");
@@ -690,7 +710,9 @@ fn a_copied_disks_restart_environment_does_not_replace_the_new_machines() {
     std::fs::create_dir_all(&state).unwrap();
     let snapshot = json!({
         "machine_id": format!("other-{machine}"),
-        "vars": [[{"Unix": b"HC_SESSION_VALUE".to_vec()}, {"Unix": b"copied-machine".to_vec()}]],
+        "boot_id": null,
+        "written_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+        "vars": [(std::ffi::OsString::from("HC_SESSION_VALUE"), std::ffi::OsString::from("copied-machine"))],
     });
     std::fs::write(state.join("restart-env.json"), serde_json::to_vec(&snapshot).unwrap()).unwrap();
     let out = cmd(&s.name, &s.root).env("HC_SESSION_VALUE", "new-machine").args(["server", "start"]).output().unwrap();
@@ -701,14 +723,41 @@ fn a_copied_disks_restart_environment_does_not_replace_the_new_machines() {
 }
 
 #[test]
-fn a_failed_environment_handoff_leaves_the_core_running() {
+fn a_core_started_from_cmd_keeps_its_environment_across_restart() {
+    use std::os::windows::process::CommandExt;
+    let s = Session::new();
+    let mut launcher = Command::new("cmd");
+    launcher.current_dir(&s.root);
+    for (key, value) in cmd(&s.name, &s.root).get_envs() {
+        match value {
+            Some(value) => {
+                launcher.env(key, value);
+            }
+            None => {
+                launcher.env_remove(key);
+            }
+        }
+    }
+    // cd records cmd.exe's hidden =C: working-directory entry for the drive.
+    let script = format!("cd /d \"{}\" && \"{BIN}\" server start", s.root.display());
+    let out = launcher.env("HC_SESSION_VALUE", "saved-from-cmd").args(["/d", "/c"]).raw_arg(script).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = cmd(&s.name, &s.root).env("HC_SESSION_VALUE", "caller").args(["server", "restart"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (code, out) = s.out(&["run", "cmd", "/d", "/c", "echo %HC_SESSION_VALUE%"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("saved-from-cmd"), "{out}");
+}
+
+#[test]
+fn a_failed_environment_handoff_still_restarts_the_core() {
     let s = Session::new();
     let before = s.json(&["server", "start"])["pid"].clone();
     let blocked = s.root.join("state/herdr-core").join(&s.name).join("restart-env.json");
     std::fs::create_dir(&blocked).unwrap();
     let (code, _) = s.out(&["server", "restart"]);
-    assert_ne!(code, 0);
-    assert_eq!(s.json(&["server", "status"])["pid"], before);
+    assert_eq!(code, 0);
+    assert_ne!(s.json(&["server", "status"])["pid"], before);
     std::fs::remove_dir(blocked).unwrap();
 }
 

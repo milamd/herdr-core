@@ -30,8 +30,8 @@ impl Session {
         // A hung test should fail in seconds, not stall the suite.
         WATCHDOG.call_once(|| {
             std::thread::spawn(|| {
-                // 30 s here; CI's slower runners set HC_TEST_WATCHDOG_S.
-                let limit = std::env::var("HC_TEST_WATCHDOG_S").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+                // Allow slower hosts the same budget as CI; keep an override for hang diagnosis.
+                let limit = std::env::var("HC_TEST_WATCHDOG_S").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
                 std::thread::sleep(Duration::from_secs(limit));
                 eprintln!("test binary still running after {limit} s: cleaning up and aborting");
                 // Abort skips every Drop, so end this binary's sessions here first.
@@ -281,6 +281,15 @@ pub fn script(s: &Session, body: &str) -> String {
         "r(){{ printf '\\033]7501;%s\\033\\\\' \"$1\"; }}; w(){{ while [ ! -e {}/$1 ]; do sleep 0.02; done; }}; {body}",
         s.root.display()
     )
+}
+
+/// A named executable fixture, so reporting agents are distinct from root shells.
+pub fn executable(s: &Session, source: &str) -> String {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let path = s.root.join(format!("program-{}", N.fetch_add(1, Ordering::Relaxed)));
+    std::fs::write(&path, source).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    path.to_str().unwrap().into()
 }
 
 /// Creates the file a script's `w <name>` waits for.

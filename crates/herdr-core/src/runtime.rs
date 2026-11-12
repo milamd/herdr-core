@@ -22,6 +22,7 @@ use persistence::RegistryWriter;
 
 pub struct Core {
     pub info: CoreInfo,
+    pub login_session: Option<platform::LoginSession>,
     pub started: Instant,
     pub stop: Notify,
     /// Set by `server.restart`: on stop, hand over instead of ending programs.
@@ -53,6 +54,7 @@ pub struct State {
     pub events: crate::events::Events,
     pub gates: HashMap<u32, crate::input::Gate>,
     pub queues: HashMap<u32, Arc<tokio::sync::Mutex<()>>>,
+    pub sends: HashMap<u32, Arc<tokio::sync::Mutex<()>>>,
     pub foreground: HashMap<u32, Vec<oneshot::Sender<i32>>>,
     /// Waits matching output: they get every byte viewers get.
     pub output_watch: HashMap<u32, Vec<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
@@ -177,6 +179,7 @@ impl Core {
         let (jobs, jobs_rx) = tokio::sync::mpsc::unbounded_channel();
         let core = Arc::new(Core {
             info,
+            login_session: platform::login_session(),
             started: Instant::now(),
             stop: Notify::new(),
             restart: Default::default(),
@@ -368,10 +371,22 @@ impl Core {
         drop(answered);
         let (bye, bye_rx) = mpsc::channel();
         let build = crate::client::build_id();
-        let current = welcome.build == build;
+        let current = platform::holder_current(
+            &welcome.build,
+            &build,
+            welcome.draining,
+            self.login_session,
+            welcome.login_session,
+        );
+        if welcome.build == build && self.login_session.is_some() && welcome.login_session.is_none() {
+            eprintln!("core: holder {} login identity unavailable; retaining build eligibility", welcome.pid);
+        }
         if require_current && !current {
             io::Write::write_all(&mut stream, &proto::frame(proto::DRAIN, 0, &[]))?;
-            return Err(io::Error::other(format!("holder build {} differs from core build {build}", welcome.build)));
+            return Err(io::Error::other(format!(
+                "holder build {} / login {:?} is not current for core build {build} / login {:?} (draining={})",
+                welcome.build, welcome.login_session, self.login_session, welcome.draining
+            )));
         }
         let (writer, frames) = mpsc::channel::<Vec<u8>>();
         let mut socket = stream.try_clone()?;
@@ -385,7 +400,7 @@ impl Core {
         let link =
             Link { writer, pid: welcome.pid, instance: welcome.instance.clone(), current, bye, bye_rx: Some(bye_rx) };
         if !current {
-            // Another build: it keeps what it runs, takes nothing new, exits when empty.
+            // Another build/login or already draining: retain its programs, take no new work.
             link.send(&proto::frame(proto::DRAIN, 0, &[]));
         }
         let (adopted, nudge) = {
@@ -434,6 +449,11 @@ impl Core {
                 continue;
             }
             adopted.push(id);
+            if let Some(saved) = st.reg.drafts.remove(&id)
+                && handover
+            {
+                st.gates.insert(id, crate::input::Gate::restore(saved));
+            }
             st.reg.terminals.get_mut(&id).expect("ours").holder = Some(instance.to_string());
             let tail = tails.remove(&id).unwrap_or_default();
             let saved = handover
@@ -912,6 +932,12 @@ impl Core {
         {
             let mut st = self.lock();
             st.holders.clear();
+            st.reg.drafts = st
+                .gates
+                .iter()
+                .filter(|(id, _)| st.reg.terminals.get(*id).is_some_and(|t| t.is_live()))
+                .filter_map(|(id, gate)| Some((*id, gate.snapshot()?)))
+                .collect();
             let State { screens, relays, .. } = &mut *st;
             for (id, screen) in screens.iter_mut() {
                 if let Some(relay) = relays.get_mut(id) {
