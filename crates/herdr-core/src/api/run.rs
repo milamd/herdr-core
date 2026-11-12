@@ -111,17 +111,6 @@ pub(super) async fn start(
     let from_afar = p.caller.as_deref().is_some_and(|c| c.contains('/'));
     let cwd = crate::exec::folder(p.cwd.as_deref(), from_afar);
     let env = child_env(crate::platform::program_env().await, p.env.clone());
-    let mut argv = p.argv.clone();
-    if let Some(program) = argv.first_mut()
-        && crate::platform::missing_core_command(program, &env, &cwd)
-    {
-        // Resolve here, not in a holder that may still run an older build.
-        *program = crate::client::executable()
-            .map_err(|e| RpcError::internal(e.to_string()))?
-            .into_os_string()
-            .into_string()
-            .map_err(|_| RpcError::internal("the core executable path is not UTF-8"))?;
-    }
     let identity = format!(
         "{} {}",
         env.get("TERM_PROGRAM").map_or("", String::as_str),
@@ -164,7 +153,7 @@ pub(super) async fn start(
             keep: p.keep,
             name: p.name,
             labels: labels(&p.labels),
-            argv: p.argv,
+            argv: p.argv.clone(),
             cwd: cwd.clone(),
             cols,
             rows,
@@ -182,7 +171,7 @@ pub(super) async fn start(
         let (tx, rx) = tokio::sync::oneshot::channel();
         st.pending.insert(id, tx);
         st.reg.terminals.get_mut(&id).expect("just created").restart_env = p.env;
-        let spawn = proto::Spawn { argv, env, cwd, cols, rows };
+        let spawn = proto::Spawn { argv: p.argv, env, cwd, cols, rows };
         st.reg.terminals.get_mut(&id).expect("just created").holder = Some(instance);
         // Queue the snapshot before spawning; the next start kills any unrecorded spawn.
         core.save(&st);
@@ -235,8 +224,7 @@ pub(crate) fn terminal_env(
     (env, scope)
 }
 
-/// The core's environment minus whoever started the core's identity, plus the
-/// caller's identity and this terminal's address.
+/// The core's environment with its own terminal identity and explicit client overrides.
 pub(crate) fn child_env(base: BTreeMap<String, String>, extra: BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = base
         .into_iter()
@@ -245,6 +233,9 @@ pub(crate) fn child_env(base: BTreeMap<String, String>, extra: BTreeMap<String, 
                 && !["HC_TERMINAL_ID", crate::sweep::VAR, crate::sweep::RUNTIME].contains(&k.as_str())
         })
         .collect();
+    env.insert("TERM".into(), "xterm-256color".into());
+    env.insert("COLORTERM".into(), "truecolor".into());
+    env.insert("TERM_PROGRAM".into(), "ghostty".into());
     crate::platform::merge_env(&mut env, extra);
     if let Ok(session) = std::env::var("HC_SESSION") {
         env.insert("HC_SESSION".into(), session);
@@ -252,9 +243,7 @@ pub(crate) fn child_env(base: BTreeMap<String, String>, extra: BTreeMap<String, 
     if let Some(lang) = crate::locale::for_programs(&env) {
         env.insert("LANG".into(), lang); // a core started from Finder has none
     }
-    env.entry("TERM".into()).or_insert_with(|| "xterm-256color".into());
-    env.entry("COLORTERM".into()).or_insert_with(|| "truecolor".into());
-    if env.get("TERM_PROGRAM").is_none_or(|p| p == "herdr") {
+    if env.get("TERM_PROGRAM").is_some_and(|p| p == "herdr") {
         env.insert("TERM_PROGRAM".into(), "ghostty".into());
         env.remove("TERM_PROGRAM_VERSION"); // the version belonged to whatever we replaced
     }

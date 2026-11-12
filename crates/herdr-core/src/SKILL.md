@@ -100,6 +100,18 @@ children finish:
 - `hc wait <t>` waits for just that terminal. Plain programs have no agent
   status, so it normally waits for exit. `hc read <t>` gets output afterward.
 
+Sends and parent notes wait for an unfinished draft, up to 60 seconds since
+the person's last key. Set `draft_wait = 5` (seconds) in
+`~/.config/herdr-core/config.toml` (Windows: `%APPDATA%\herdr-core\config.toml`)
+to change that limit; `0` keeps only the quiet pause. Like `notes_quiet`,
+it is read for each delivery and takes precedence over the test environment
+fallback (`HC_DRAFT_MS`). Both settings take finite seconds (a negative value means 0)
+that fit in a duration. If the config is invalid, delivery uses defaults and
+logs the config error once in `core.log`. Reverse sends allow at least the
+default 60-second hold, but a parent configured above that
+can still outwait a child with a shorter limit. Sends to an added machine keep
+waiting while its line is alive.
+
 Reports arrive tagged, for example:
 
 ```text
@@ -169,7 +181,11 @@ Your harness's own file tools touch only the machine you run on. Use hc for
 remote files and commands. `hc machine ls` lists configured machines; see
 `hc machine --help` to configure SSH or `--via <cmd>` connections.
 Without `--name`, SSH machines use the first host label (IPs stay whole),
-shortened to 32 characters with `-2`, `-3`, etc. added if the name is taken.
+shortened to 32 characters with `-2`, `-3`, etc. added if the name is taken
+or looks like a terminal id (`t14` becomes `t14-2`).
+On Windows, `--via` is a program and its arguments (CommandLineToArgvW split,
+no shell), with the remote line appended as one argument, no console window;
+Unix stays an sh line. For WSL: `hc machine add --via 'wsl.exe -d Ubuntu -e sh -c' --name wsl`.
 
 A remote child can send, get, read, wait, and report notes back to its local
 parent. The local run request determines callback access; the remote reply
@@ -205,25 +221,35 @@ paths start at your current folder. Prefer explicit paths for remote work.
 - State is `live` or `finished`. Status comes from the program's OSC 7501
   reports: `idle`, `working`, `done`, `blocked`, `error`; plain programs
   report none. Do not guess status from screen text.
+  On Unix, status clears when the root interactive shell returns to the foreground.
+  Direct programs and shell command/script wrappers keep status while their tools run.
+  Returning to a nested shell is not detected; a shell's own status and a backgrounded
+  agent's status clear. Windows and Unix PowerShell do not clear on shell return yet.
 - `blocked` means a person is needed (permission or a question): read the
   screen and ask your user. `send` refuses unless `--force`; don't use it to
   bypass a permission decision. `error`: read why, then send or kill.
+- A new Linux core started over SSH loads the account shell's non-interactive
+  login environment once, so remote terminals and commands can find programs
+  from login PATH settings. Local Linux starts, macOS and Windows are unchanged.
+  Reconnecting and crash recovery keep the loaded environment. Profiles have five
+  seconds and a combined 1 MiB output limit; remaining profile jobs are ended after
+  capture. A failed or blocked profile falls back to the incoming environment and records
+  the shell and reason in `core.log`. To refresh an existing remote core, run
+  `hc server restart --fresh` from a normal SSH login outside Herdr.
 - `hc run` without a command starts this machine's own shell. On macOS,
   this is a login shell so it loads the login environment; explicit commands
   are unchanged. Recovery shells use the same rule.
-- A direct terminal command named `hc` or `herdr-core` uses the serving core's
-  executable if the name is absent from the terminal's PATH (Windows also
-  accepts `.exe`, case-insensitively, and searches PATHEXT). Existing PATH
-  choices and explicit paths stay unchanged; shell command lines don't get
-  this fallback.
 - `shell = ["nu"]` in `~/.config/herdr-core/config.toml` (Windows:
   `%APPDATA%\herdr-core\config.toml`) overrides the shell for new terminals
   and recovery. Each list item is one argument. Changes apply on the next
   launch; running programs stay running. A missing executable reports
   `spawn_failed`; recovery retries and logs launch errors in `holder.log`.
-- Programs get the login session's environment. A local `DISPLAY` or
-  `WAYLAND_DISPLAY` is left out only when its socket is missing or refuses
-  connections. Host displays (including SSH forwarding) stay as they are.
+- Programs get the login session's environment with the core's terminal identity:
+  TERM=xterm-256color, COLORTERM=truecolor and TERM_PROGRAM=ghostty, with no
+  TERM_PROGRAM_VERSION. The caller's identity is not forwarded. Explicit API
+  `env` overrides still apply; kept replacement shells retain that identity.
+  A local `DISPLAY` or `WAYLAND_DISPLAY` is left out only when its socket is
+  missing or refuses connections. Host displays (including SSH forwarding) stay as they are.
   A missing `XAUTHORITY` file does not remove a display.
 - `hc keep <t>` (or `run --keep`) replaces a lost program with a shell,
   never reruns a task. `hc keep <t> --off` disables recovery. Signal death
@@ -260,12 +286,34 @@ paths start at your current folder. Prefer explicit paths for remote work.
   bundled remote core: run `hc update` there instead. Root remotes receive the
   standalone release.
 - On macOS, desktop starts use a one-shot launchd job so quitting the launching
-  app doesn't end terminals. SSH starts stay direct. If launchd fails, startup
-  falls back to a direct child and logs the reason in `core.log`; that core may
-  end with its launching app.
-- Planned restarts and updates preserve the core's launch environment for new
-  terminals; per-terminal API `env` overrides still apply. A stop followed by a
-  fresh start uses the new launcher's environment.
+  app doesn't end terminals. Startup explicitly requests that job once, including
+  during login when automatic launches may be deferred. SSH starts stay direct.
+  If launchd fails, startup falls back to a direct child and logs the reason in
+  `core.log`; that core may end with its launching app. A start timeout records
+  the job label, failed phase and available spawn state before cleanup.
+- On macOS, reopening Herdr after logout/login refreshes an older GUI core's
+  login context while keeping surviving terminals. New terminals use the new
+  login; existing programs retain their original OS context. An explicit
+  `hc server restart` from a healthy login also retires holders from another
+  login without ending their programs. Viewing a healthy SSH core does not
+  replace it, and lock/unlock does not rotate holders. Cores installed before
+  this session metadata need an update or explicit restart once.
+- Updates and `hc server restart` keep the environment the core started with.
+  Run `hc server restart --fresh` from a terminal outside Herdr to use that shell's
+  environment for new terminals without ending running programs. Existing
+  programs keep their environment; kept terminals use the fresh one after
+  recovery. Stopping and starting also takes a fresh environment. Per-terminal
+  API `env` overrides still apply, as do Linux session and Windows registry
+  refreshes. On macOS, a saved SSH agent socket that no longer answers is replaced
+  by the launcher's value. SIGTERM hands over terminals/screens but does not save an environment.
+  Preservation is best effort: a failed save never blocks a restart.
+  The private handoff expires after three
+  minutes and cannot cross a Linux/macOS boot. Windows checks age, not the boot:
+  a requested restart interrupted by a fast reboot can reuse it once. Session
+  paths (HOME, XDG, HC_SESSION, HC_SOCKET) and service bookkeeping stay with the
+  new launcher. On macOS, SSH versus launchd is still chosen by that launcher,
+  not by the saved environment. The update from an older core to 0.1.19 takes the
+  updater's environment once: older cores can't write the note for their successor.
 - On Unix, exit, `hc kill`, pane close and server stop do not sweep detached
   processes. They hang up the terminal and end its own program and foreground
   job; deliberately detached programs can survive (background server ports may

@@ -5,6 +5,51 @@ use crate::paths::Paths;
 use std::sync::atomic::AtomicBool;
 
 #[tokio::test]
+async fn replaced_and_disconnected_peers_release_pending_calls() {
+    let root = std::path::PathBuf::from(format!("/var/tmp/hc-peer-close-{}", crate::platform::random_hex()));
+    let paths = Paths {
+        socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
+        state: root.clone(),
+        config: root.join("config.toml"),
+    };
+    paths.create_dirs().unwrap();
+    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "desktop".into() }).unwrap();
+    let hello = json!({"core": {"id": "remote", "name": "away"}});
+    for replacement in [false, true] {
+        let conn = Arc::new(Conn::default());
+        peer_joined(&core, &conn, &hello);
+        let line = core.lock().peer_lines["remote"].1.clone();
+        let (tx, mut rx) = oneshot::channel();
+        lock(&line.pending).insert(99, (tx, None));
+        let next = Arc::new(Conn::default());
+        if replacement {
+            peer_joined(&core, &next, &hello);
+        }
+        peer_left(&core, &conn);
+        assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed), "replacement: {replacement}");
+        let sent = tokio::time::timeout(
+            Duration::from_millis(200),
+            line.call("away", "terminal.send", json!({"terminal": "t1", "text": "hi"}), Duration::from_secs(30)),
+        )
+        .await
+        .expect("a closed peer must not hold a new send");
+        assert!(sent.unwrap_err().message.contains("lost the line"));
+        if replacement {
+            assert_eq!(
+                core.lock().peer_lines["remote"].0,
+                conn_key(&next),
+                "the old peer cannot remove its replacement"
+            );
+            peer_left(&core, &next);
+        }
+        assert!(core.lock().peer_lines.is_empty());
+    }
+    drop(core);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn callback_grants_come_from_the_local_request_not_the_remote_parent() {
     let root = std::path::PathBuf::from(format!("/var/tmp/hc-callback-grants-{}", crate::platform::random_hex()));
     let paths = Paths {
@@ -104,6 +149,27 @@ fn remote_event_lines_cannot_accumulate_past_the_frame_limit() {
     assert!(lock(&line.mirror).2.len() <= wire::MAX_PAYLOAD, "incomplete events must stay bounded");
     drop(core);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_send_on_an_already_closed_line_fails_without_waiting() {
+    for writer_gone in [false, true] {
+        let (frames, mut rx) = mpsc::unbounded_channel();
+        let line = Line::new(frames, &json!({}));
+        if writer_gone {
+            rx.close();
+        } else {
+            line.close(); // The writer may not have finished shutting down yet.
+        }
+        let sent = tokio::time::timeout(
+            Duration::from_millis(200),
+            line.call("away", "terminal.send", json!({"terminal": "t1", "text": "hi"}), Duration::from_secs(30)),
+        )
+        .await
+        .expect("a closed transport must not hold a send");
+        assert!(sent.unwrap_err().message.contains("lost the line"));
+        assert!(lock(&line.pending).is_empty());
+    }
 }
 
 #[test]

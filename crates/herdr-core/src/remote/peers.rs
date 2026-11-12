@@ -86,7 +86,9 @@ pub fn peer_joined(core: &Arc<Core>, conn: &Arc<Conn>, hello: &Value) {
     for message in std::mem::take(&mut peer.outbox) {
         line.message(&message);
     }
-    st.peer_lines.insert(id.into(), (conn_key(conn), line));
+    if let Some((_, old)) = st.peer_lines.insert(id.into(), (conn_key(conn), line)) {
+        old.close();
+    }
     save_peers(core, &st);
 }
 
@@ -113,7 +115,12 @@ pub fn is_peer(core: &Core, conn: &Arc<Conn>) -> bool {
 
 pub fn peer_left(core: &Core, conn: &Arc<Conn>) {
     let key = conn_key(conn);
-    core.lock().peer_lines.retain(|_, (k, _)| *k != key);
+    core.lock().peer_lines.retain(|_, (k, line)| {
+        if *k == key {
+            line.close();
+        }
+        *k != key
+    });
 }
 
 /// A reply from a peer to one of our calls. False: not a peer's connection.

@@ -120,6 +120,9 @@ pub struct HelloResult {
     pub framed: bool,
     pub methods: Vec<String>,
     pub features: Vec<String>,
+    /// OS login inherited by this core. Absent when unavailable or unsupported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_session: Option<crate::platform::LoginSession>,
 }
 
 #[derive(Serialize, JsonSchema, Clone)]
@@ -180,6 +183,14 @@ pub struct DocSetResult {
     pub version: u64,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct RestartParams {
+    /// Replacement environment for the next core; requires PATH. Omit to preserve
+    /// this core's environment. Normal startup filtering applies; session paths
+    /// and service bookkeeping still belong to the next launcher.
+    pub environment: Option<BTreeMap<String, String>>,
+}
+
 #[derive(Serialize, JsonSchema)]
 pub struct StopResult {
     pub stopped: bool,
@@ -229,8 +240,8 @@ pub struct RunParams {
     #[arg(long, value_name = "MACHINE")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<String>,
-    /// Set on top of the core's environment. Clients pass their terminal
-    /// identity here (TERM, TERM_PROGRAM, COLORTERM).
+    /// Override the core's environment and terminal identity. Omit terminal
+    /// identity variables to use the core's defaults.
     #[arg(skip)]
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -735,7 +746,10 @@ pub struct MachineAddParams {
     /// Reach it with this command instead of ssh: it is given a shell line to
     /// run there as its last argument, like ssh (`ssh -p 2222 -i key user@ip`,
     /// `fly ssh console -a app --pty=false -C`). It must pass bytes both ways
-    /// untouched and ask nothing. Needs --name.
+    /// untouched and ask nothing. Needs --name. On Windows, a program and its
+    /// arguments (CommandLineToArgvW split, no shell), with the remote line
+    /// appended as one argument, no console window; Unix stays an sh line.
+    /// WSL: --via 'wsl.exe -d Ubuntu -e sh -c' --name wsl.
     #[arg(long, value_name = "COMMAND")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,

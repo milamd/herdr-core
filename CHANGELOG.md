@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## [0.1.20] - 2026-11-10
+
+### New
+- `hc server restart --fresh` takes your current shell's environment for new terminals without ending running programs. Run it from a terminal outside Herdr if an agent started Herdr with unwanted settings.
+- On Windows, `hc machine add --via` works: it takes a program and its arguments, so WSL can be a machine with `hc machine add --via 'wsl.exe -d Ubuntu -e sh -c' --name wsl`. (#128)
+
+### Fixed
+- **On macOS, quitting an app you started from a terminal no longer leaves a "running in background" entry that ends every terminal when you stop it.** Terminals opened before this update keep the old behavior until you close them: stopping such an entry can still end those older terminals, and on macOS 27 an app that left an entry before the update can leave one more. (#140)
+- **On macOS, terminals opened after you log out and back in work again:** they find your user, ssh works, and they use the new login's ssh agent. Terminals from before the logout keep running. (#210)
+- **On macOS, the core starts separately from the Herdr app, also right after login or a reboot.** Before, it often ended up running inside the app then, so force quitting Herdr ended those terminals.
+- Every terminal gets a real terminal type (`TERM=xterm-256color`), also when the command that started it ran in a shell with `TERM=dumb`, like an agent's, so tmux, vim and htop start. (#205)
+- `hc machine add` accepts a host whose name looks like a terminal id (`t440s` becomes the machine `t440s-2`), and `hc machine add user@host:2222` typed in a terminal works. (#206)
+- On Linux and macOS, when an agent exits back to your shell (bash, zsh, fish), its terminal stops showing the agent's last status. (#166, thanks @jorgeacortes)
+- `hc wait --output` finds text that arrived split in the middle of a character. (#129, thanks @chanyang721)
+- `hc keep --off` on a terminal that is already gone reports it as finished. (#125, thanks @chanyang721)
+- The core no longer spins when a kept terminal with helpers has lost its program. (#124, thanks @chanyang721)
+- A message sent from a plain shell on another machine arrives without an agent tag. (#119, thanks @CMU02)
+- A command run right while the core restarts no longer fails with "core did not start".
+- Agent messages and parent notes wait for you to send or clear an unfinished draft, instead of submitting it with their message. A draft left alone holds messages for at most a minute by default; `draft_wait` in config.toml sets the limit in seconds, and `0` keeps only the quiet pause. Sends to another machine wait too, once both machines are updated. (#64, thanks @pruett)
+
+## [0.1.19] - 2026-11-07
+
+### New
+- **On Linux and macOS, programs you deliberately detach keep running when their terminal closes, like in tmux.** A dev server or job started with `nohup`, `setsid` or as a daemon survives closing its pane, so its port may stay busy until you stop it. Windows still ends everything a terminal started. Terminals opened before this update keep the old behavior until they're reopened. (#136)
+- **Updates and `hc server restart` keep the environment the core started with.** Running an update from a shell with, say, `NO_COLOR=1` no longer turns colors off in every new terminal. Stopping and starting the core takes a fresh environment. The update to 0.1.19 itself still takes the updater's environment once. (#20, #21, thanks @JJLiebig)
+
+### Fixed
+- On older Linux like RHEL or Rocky 8 (systemd 239), the core starts and restarts as a service. (#135, thanks @FredKhayat)
+- On Windows, programs installed under a system PATH entry like `%ProgramFiles%\...` (PowerShell 7, Git, starship) are found in terminals, as in Windows Terminal. (herdr-app#631)
+- `hc attach` no longer garbles a character that was half printed when you attached. (#144, thanks @sundarshahi)
+- A core that's slow to start, right after an update for example, gets 15 seconds before hc reports that it didn't start.
+
 ## [0.1.18] - 2026-11-04
 
 ### New
