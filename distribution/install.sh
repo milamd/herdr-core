@@ -37,7 +37,7 @@ sha256() {
 }
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "$tmp" "$bin/herdr-core.staged"' EXIT
 
 manifest="$releases/core/latest.json"
 [ -n "${HC_VERSION:-}" ] && manifest="$releases/core/$HC_VERSION/manifest.json"
@@ -64,8 +64,9 @@ esac
 curl -fsSL "$download" -o "$tmp/hc.tar.gz" || fail "download failed: $url"
 [ "$(sha256 "$tmp/hc.tar.gz")" = "$want" ] || fail "the download is damaged (checksum mismatch); try again"
 tar -xzf "$tmp/hc.tar.gz" -C "$tmp"
-# Verify every downloaded macOS executable before even asking its version.
-# A checksum from the same release service does not establish its signer.
+# Verify every downloaded macOS executable from the default service before
+# even asking its version. The same release service's checksum does not prove
+# who signed the code.
 if [ "$os" = macos ]; then
   case "$releases" in
     https://releases.herdr.dev | https://releases.herdr.dev/)
@@ -75,7 +76,15 @@ if [ "$os" = macos ]; then
       done ;;
   esac
 fi
-"$tmp/herdr-core" --version >/dev/null 2>&1 || fail "the downloaded hc does not run on this machine"
+core=$tmp/herdr-core
+if ! "$core" --version >/dev/null 2>&1; then
+  # A noexec mount under the temp dir fails the check with EACCES, which is
+  # not "cannot run here": stage on the destination filesystem and re-check.
+  mkdir -p "$bin"
+  core=$bin/herdr-core.staged
+  cp "$tmp/herdr-core" "$core" && chmod 755 "$core" || fail "cannot stage hc in $bin"
+  "$core" --version >/dev/null 2>&1 || fail "the downloaded hc does not run on this machine"
+fi
 # App completion must converge even before the first bundled release exists.
 if [ "${HC_BUNDLE_ONLY:-0}" = 1 ] && [ ! -x "$tmp/Herdr Core.app/Contents/MacOS/herdr-core" ]; then
   exit 0
@@ -107,10 +116,10 @@ if [ "$bundle" = 1 ] && [ -x "$tmp/Herdr Core.app/Contents/MacOS/herdr-core" ]; 
   say "hc $version $action as Herdr Core.app. Recreate pre-update terminals if macOS privacy access is broken; running terminals were kept."
 elif [ -x "$bin/herdr-core" ]; then
   # Swapped the planned way, so its terminals keep running.
-  "$bin/herdr-core" update --from "$tmp/herdr-core" >/dev/null || fail "updating $bin/herdr-core failed (see above)"
+  "$bin/herdr-core" update --from "$core" >/dev/null || fail "updating $bin/herdr-core failed (see above)"
   say "hc updated to $version."
 else
-  cp "$tmp/herdr-core" "$bin/herdr-core.new"
+  cp "$core" "$bin/herdr-core.new"
   chmod 755 "$bin/herdr-core.new"
   mv -f "$bin/herdr-core.new" "$bin/herdr-core"
   say "hc $version installed into $bin/herdr-core."

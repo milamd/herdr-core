@@ -1040,9 +1040,10 @@ impl Pty {
         }
     }
 
-    /// No process groups on a pseudo console: the program it started.
+    /// No process groups on a pseudo console: a known shell's newest child,
+    /// else the terminal's first process.
     pub fn foreground(&self) -> i32 {
-        self.pid as i32
+        super::windows_foreground::in_front(self.job.as_raw_handle() as HANDLE, self.pid) as i32
     }
 
     /// Ctrl+C through the console for an interrupt; anything harder ends the

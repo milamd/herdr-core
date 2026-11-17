@@ -11,6 +11,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,6 +25,8 @@ type Waiting = (oneshot::Sender<Value>, Option<(Sink, bool)>);
 
 mod mirror;
 mod peers;
+mod put;
+mod run;
 mod viewers;
 pub use mirror::rename_mirror;
 use mirror::{mirror_events, mirror_replace};
@@ -32,6 +35,7 @@ pub use peers::{
     Peer, called_there, from_peer, is_peer, orphaned, orphaned_afar, peer_address, peer_joined, peer_left, reply_in,
     tell_peer,
 };
+use run::forward_once;
 #[cfg(test)]
 use viewers::automatic_input;
 use viewers::{RESIZE_LOST, negotiate_resize, reattach};
@@ -58,6 +62,10 @@ pub struct Line {
     /// What the core there said it can do (its `hello`).
     features: Vec<String>,
     closed: AtomicBool,
+    /// Puts in pieces take turns on it.
+    bulk: put::Lane,
+    /// Given up though it still hears from there (`remote/put.rs`): dialed again.
+    pub(super) retired: tokio::sync::Notify,
 }
 
 impl Line {
@@ -71,6 +79,8 @@ impl Line {
             streams: Mutex::default(),
             next: AtomicU64::new(2),
             mirror: Mutex::default(),
+            bulk: Default::default(),
+            retired: Default::default(),
         })
     }
 
@@ -240,7 +250,7 @@ pub fn start_all(core: &Arc<Core>) {
 }
 
 /// Dials the machine, holds the line, and dials again after a drop (backing
-/// off to 30 s) until the machine is removed.
+/// off to 30 s, or more slowly when a login is needed) until it is removed.
 pub fn keep_up(core: &Arc<Core>, id: String) {
     let mut st = core.lock();
     st.lines.insert(id.clone(), LineState::Connecting);
@@ -271,6 +281,7 @@ pub fn forget(core: &Core, st: &mut State, id: &str) {
 
 async fn supervise(core: Arc<Core>, id: String) {
     let mut backoff = Duration::from_millis(250);
+    let mut login_backoff = Duration::ZERO;
     loop {
         let Some(m) = core.lock().machines.iter().find(|m| m.id == id).cloned() else { return };
         let down = |st: &mut State, why: String| {
@@ -297,6 +308,7 @@ async fn supervise(core: Arc<Core>, id: String) {
             }
             Ok(d) => {
                 backoff = Duration::from_millis(250);
+                login_backoff = Duration::ZERO;
                 // It may have been updated since it was added.
                 if let Some(v) = d.hello["version"].as_str().filter(|v| *v != m.version) {
                     let mut st = core.lock();
@@ -312,12 +324,35 @@ async fn supervise(core: Arc<Core>, id: String) {
                 core.changed.notify_waiters();
                 continue;
             }
-            Err(e) if e.kind == "needs_login" => down(&mut core.lock(), "needs_login".into()),
+            Err(e) if e.kind == "needs_login" => {
+                down(&mut core.lock(), "needs_login".into());
+                // Slow enough that a failing key doesn't get the person banned (fail2ban, CrowdSec),
+                // but an ssh-agent unlocked later still reconnects on its own.
+                login_backoff = Duration::from_secs(match login_backoff.as_secs() {
+                    0 => 120,
+                    120 => 300,
+                    _ => 600,
+                });
+                tokio::time::sleep(login_backoff).await;
+                continue;
+            }
             Err(e) if e.kind == "incompatible" => down(&mut core.lock(), "needs_update".into()),
             Err(e) => down(&mut core.lock(), e.message),
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(reconnect_max());
+    }
+}
+
+async fn refresh_status(core: &Arc<Core>, m: &Machine, line: &Arc<Line>) {
+    loop {
+        if let Ok(status) = line.call(&m.name, "server.status", json!({}), Duration::from_secs(2)).await {
+            let mut st = core.lock();
+            let Some(saved) = st.machines.iter_mut().find(|saved| saved.id == m.id) else { return };
+            saved.keeps_running_after_logout = status["keeps_running_after_logout"].as_bool();
+            saved.logout_linger_user = status["logout_linger_user"].as_str().map(String::from);
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
 
@@ -334,6 +369,8 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
     }
     core.changed.notify_waiters();
     tokio::spawn(reattach(core.clone(), m.clone(), line.clone()));
+    let refresh = refresh_status(core, m, &line);
+    tokio::pin!(refresh);
     // Everything that happens there, to keep its mirror here and tell subscribers.
     let id = line.next.fetch_add(1, Ordering::Relaxed);
     lock(&line.mirror).0 = id;
@@ -358,12 +395,14 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
     let mut sends = crate::server::Sends::default();
     loop {
         let (channel, kind, payload) = tokio::select! {
+            () = &mut refresh => break,
             frame = wire::read_frame(&mut stdout) => match frame {
                 Ok(Some(frame)) => frame,
                 _ => break,
             },
+            () = line.retired.notified() => break,
             () = heard.silent_for(silence) => {
-                eprintln!("core: {} sent nothing for {} s: line given up", m.name, silence.as_secs());
+                let _ = writeln!(io::stderr(), "core: {} sent nothing for {} s: line given up", m.name, silence.as_secs());
                 break;
             }
         };
@@ -434,7 +473,7 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
     line.close();
     // Viewers here hear that the line is gone and stay open; the programs keep
     // running there, and the viewers get them back with the line.
-    let notice = format!("\r\n[line to {} lost; reconnecting...]\r\n", m.name);
+    let notice = lost_notice(&m.name);
     for (_, (conn, here)) in lock(&line.streams).drain() {
         conn.with(|out| {
             out.data(here, notice.as_bytes());
@@ -443,6 +482,11 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
     // Killed, not waited for: a Mac core once never heard the old ssh had
     // died and stayed "connecting" for good. It is reaped in the background.
     let _ = d.child.start_kill();
+}
+
+/// CAN first: the line may have dropped mid-sequence, which would swallow this.
+fn lost_notice(machine: &str) -> String {
+    format!("\x18\r\n[line to {machine} lost; reconnecting...]\r\n")
 }
 
 pub fn conn_key(conn: &Arc<Conn>) -> usize {
@@ -663,57 +707,13 @@ async fn forward_waiting(core: &Core, m: &Machine, method: &str, mut params: Val
 }
 
 pub async fn forward(core: &Core, m: &Machine, method: &str, params: Value) -> Result<Value, RpcError> {
+    if method == "terminal.put" {
+        return put::forward(core, m, params).await;
+    }
     match waits(method, &params) {
         true => forward_waiting(core, m, method, params).await,
         false => forward_once(core, m, method, params).await,
     }
-}
-
-async fn forward_once(core: &Core, m: &Machine, method: &str, mut params: Value) -> Result<Value, RpcError> {
-    // Only the local request can delegate access to a terminal here. An
-    // explicit parent names a terminal there, not the caller here.
-    let parent = if method == "terminal.run" && params["parent"].is_null() && params["no_parent"] != true {
-        params["caller"]
-            .as_str()
-            .and_then(|caller| crate::addr::local(caller, &core.info.id, &core.info.name).ok())
-            .and_then(crate::terminals::parse_id)
-    } else {
-        None
-    };
-    if method == "terminal.run" {
-        // An older core ends a child with its parent only when asked to.
-        params["die_with_parent"] = json!(params["outlive_parent"] != true);
-    }
-    let deadline = if method == "terminal.send" { Duration::MAX } else { deadline_for(core, method, &params) };
-    let line = line(core, m).await?;
-    // An older core would read no program as "nothing to run".
-    let own_shell = params["argv"].as_array().is_none_or(Vec::is_empty) || params.get("line").is_some();
-    if method == "terminal.run" && own_shell && !line.features.iter().any(|f| f == "shell") {
-        return Err(RpcError::new(
-            "needs_update",
-            format!("{}'s hc is older and can't pick its own shell", m.name),
-            format!("hc machine update {}", m.name),
-        ));
-    }
-    let reply = line.call(&m.name, method, params, deadline).await.map_err(|e| match e.kind.as_str() {
-        "unknown_method" => RpcError::new(
-            "needs_update",
-            format!("{}'s hc is older and has no {method}", m.name),
-            format!("hc machine update {}", m.name),
-        ),
-        _ => e,
-    })?;
-    // Document contents are opaque: address-shaped keys belong to the client.
-    let reply = if method.starts_with("doc.") { reply } else { localize(core, &m.name, &[], reply) };
-    // The remote response is data, never authority to choose a local parent.
-    if let Some(parent) = parent {
-        let mut st = core.lock();
-        if let Some(t) = st.reg.terminals.get_mut(&parent) {
-            t.afar.insert(m.id.clone());
-            core.save(&st);
-        }
-    }
-    Ok(reply)
 }
 
 pub async fn forward_to(core: &Core, to: &To, method: &str, params: Value) -> Result<Value, RpcError> {
