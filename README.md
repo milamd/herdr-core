@@ -29,6 +29,13 @@ just install
 hc --help
 ```
 
+On macOS, `just install` selects the build target from the hardware: Apple Silicon
+gets `aarch64-apple-darwin`, including when the shell is running under Rosetta.
+To build that release binary without installing it, run
+`cargo build --locked --release -p herdr-core --target aarch64-apple-darwin`.
+If using an x86_64 Rust toolchain under Rosetta, install that target first with
+`rustup target add aarch64-apple-darwin`.
+
 On Linux and macOS, the default install directory is `~/.local/bin`; add it to
 PATH if needed. On Windows, it is `%LOCALAPPDATA%\Programs\herdr-core`, which the
 installer adds to your user PATH; open a new shell afterward. The Windows install
