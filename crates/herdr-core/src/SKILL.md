@@ -178,7 +178,18 @@ Use the returned address to wait/read it; don't launch a duplicate.
 ## Other machines and files
 
 Your harness's own file tools touch only the machine you run on. Use hc for
-remote files and commands. `hc machine ls` lists configured machines; see
+remote files and commands. On Linux with systemd, hc tries to enable lingering.
+If denied and logind has a finite stop delay, machine add warns and machine ls
+marks `! stops at logout`: programs end when the account's last login closes.
+An infinite or unreadable delay reports unknown. Run the suggested
+`sudo loginctl enable-linger -- <user>` on
+that machine once; the warning clears after the next background check and status
+refresh. The core checks at startup, after its own enable attempt, and about
+every minute. Until the first check finishes, the result is unknown.
+JSON carries `keeps_running_after_logout` (true, false, or null when unknown /
+not applicable) and `logout_linger_user`, also in hello and server.status.
+
+`hc machine ls` lists configured machines; see
 `hc machine --help` to configure SSH or `--via <cmd>` connections.
 Without `--name`, SSH machines use the first host label (IPs stay whole),
 shortened to 32 characters with `-2`, `-3`, etc. added if the name is taken
@@ -192,6 +203,8 @@ parent. The local run request determines callback access; the remote reply
 cannot choose another local parent. `--no-parent` or an explicit parent on
 the remote machine grants no callback access to the local caller.
 Remote event lines over 16 MiB disconnect the connection, which core redials.
+A machine whose SSH login fails shows `needs_login` and retries slowly (up to
+every 10 minutes); `hc machine login <name>` in a terminal reconnects now.
 
 On Windows, `hc server status` never starts a core. If elevated SSH startup
 would block the same user's desktop session, open Herdr on that Windows
@@ -208,6 +221,8 @@ hc file edit --on vps /srv/app/src/x.rs --old 'exact text' --new 'replacement'
 hc file write --on vps /srv/app/src/y.rs < content.txt
 ```
 
+`exec` ends the command and everything it started after 60 s by default
+(`--timeout S`, at most 600); use `run` for anything longer.
 `exec -i` feeds piped input to the command. File writes replace the whole
 file and create parent folders. Edits require the old text exactly once;
 `edit_failed` means add enough context to make it unique. Repeat `--old` and
@@ -257,7 +272,13 @@ paths start at your current folder. Prefer explicit paths for remote work.
   every OS, including after a host shutdown. On macOS, shutdown warnings
   preserve kept programs even if they catch a signal and exit with a code;
   on Linux, systemd stops the core before its holders. Ordinary exits and
-  explicit kills remain final. Streams end on loss; reattach after the
+  explicit kills remain final. Set `restore_screen = true` in
+  `~/.config/herdr-core/config.toml` (Windows: `%APPDATA%\herdr-core\config.toml`)
+  to show the lost program's last saved screen above the new shell, separated
+  by a divider. It defaults to false and applies at the next recovery. On Windows,
+  the old screen is in history. `hc read` includes restored text, so scripts
+  reading it can match old output. Saved screens are consumed or discarded once; a power cut
+  that saves nothing starts blank. Streams end on loss; reattach after the
   restarted event. Pending input/attach may be unavailable: retry after recovery.
 - Once work is accepted: `hc kill <t>`, then `hc rm <t>`. Only clean up
   terminals you started; `hc ls` includes your user's other live work.

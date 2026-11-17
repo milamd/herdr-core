@@ -2,7 +2,7 @@
 //! bytes (minus answered queries), input, and who sets the size.
 
 use crate::holder_proto as proto;
-use crate::relay::Relay;
+use crate::relay::image_answer_wait;
 use crate::rpc::RpcError;
 use crate::runtime::{Core, State};
 use crate::wire::Conn;
@@ -40,6 +40,7 @@ pub struct Viewer {
     display: Display,
     /// An unfinished sequence exceeded continuation tracking; skip its tail.
     pub(crate) recovering: bool,
+    answers: crate::relay::Answers,
 }
 
 impl Display {
@@ -90,8 +91,11 @@ impl Core {
             active_at: (!req.resumed).then(Instant::now),
             display: req.display,
             recovering,
+            answers: Default::default(),
         });
-        self.apply_size(&mut st, id);
+        if !req.observe {
+            self.apply_size(&mut st, id);
+        }
         let paint = first_paint(&st, id, req.history);
         st.viewers.get_mut(&id).unwrap().last_mut().unwrap().repaint_pending = false;
         conn.with(|out| {
@@ -106,9 +110,42 @@ impl Core {
         Ok(channel)
     }
 
+    /// A single runtime task owns image deadlines, including output from holder threads.
+    pub async fn expire_image_answers(self: Arc<Self>) {
+        loop {
+            let next = {
+                let mut st = self.lock();
+                let now = tokio::time::Instant::now();
+                let due: Vec<_> = st
+                    .image_deadlines
+                    .iter()
+                    .filter(|(_, (_, at))| *at <= now)
+                    .map(|(&id, &(wait, _))| (id, wait))
+                    .collect();
+                for (id, wait) in due {
+                    st.image_deadlines.remove(&id);
+                    let late = st.relays.get_mut(&id).map(|r| r.expire(wait)).unwrap_or_default();
+                    let Some(gate) = st.gates.get_mut(&id) else { continue };
+                    let late = gate.viewer(&late, false);
+                    if let Some(link) = st.link(id) {
+                        link.input(id, &late);
+                    }
+                }
+                st.image_deadlines.values().map(|&(_, at)| at).min()
+            };
+            match next {
+                Some(at) => tokio::select! {
+                    _ = tokio::time::sleep_until(at) => {}
+                    _ = self.image_due.notified() => {}
+                },
+                None => self.image_due.notified().await,
+            }
+        }
+    }
+
     /// Program output: through the relay to the screen and every viewer,
     /// then whatever status or title it reported.
-    pub fn output(&self, st: &mut State, id: u32, bytes: &[u8]) {
+    pub fn output(self: &Arc<Self>, st: &mut State, id: u32, bytes: &[u8]) {
         st.last_output.insert(id, Instant::now());
         *st.output_seq.entry(id).or_default() += 1;
         if let Some(t) = st.reg.terminals.get_mut(&id) {
@@ -117,7 +154,7 @@ impl Core {
         // While a read scrolls the app, its frames are ours alone: viewers get one repaint after.
         let scrolling = st.stitching.contains(&id);
         let instance = st.reg.terminals.get(&id).and_then(|t| t.holder.clone());
-        let State { screens, relays, viewers, holders, output_watch, .. } = st;
+        let State { screens, relays, viewers, holders, output_watch, gates, .. } = st;
         let holder = holders.iter().find(|l| Some(&l.instance) == instance.as_ref());
         let Some(screen) = screens.get_mut(&id) else { return };
         let relay = relays.entry(id).or_default();
@@ -128,8 +165,15 @@ impl Core {
         if let Some(watchers) = output_watch.get_mut(&id).filter(|_| !scrolling) {
             watchers.retain(|w| w.send(out.clone()).is_ok());
         }
+        relay.expect_answers(viewers.get_mut(&id).into_iter().flatten().filter(|v| !v.observe).map(|v| &mut v.answers));
+        let (replies, wait) = relay.take_replies(screen, answering(viewers.get(&id)));
+        let replies = ordered_replies(gates.entry(id).or_default(), &replies);
         if let Some(link) = holder {
-            link.input(id, &Relay::take_responses(screen));
+            link.input(id, &replies);
+        }
+        if let Some(wait) = wait {
+            st.image_deadlines.insert(id, (wait, tokio::time::Instant::now() + image_answer_wait()));
+            self.image_due.notify_one();
         }
         let reports = screen.take_status_reports();
         let title = screen.take_title_changed().then(|| screen.title());
@@ -259,7 +303,18 @@ impl Core {
             self.touch(&mut st, conn, channel, |_| {})
         };
         if let Some(id) = id {
-            let now = st.gates.entry(id).or_default().viewer(bytes, !automatic);
+            let answered = Self::viewer(&mut st, conn, channel).unwrap().1.answers.feed(bytes);
+            let mut now = Vec::new();
+            let mut from = 0;
+            // Insert at the complete answer, before any trailing unfinished APC.
+            // Queue both through the gate so expiry cannot overtake them.
+            for (end, query) in answered {
+                now.extend(st.gates.entry(id).or_default().viewer(&bytes[from..end], !automatic));
+                let waited = st.relays.get_mut(&id).map(|r| r.answered(&[(end, query)])).unwrap_or_default();
+                now.extend(st.gates.entry(id).or_default().viewer(&waited, false));
+                from = end;
+            }
+            now.extend(st.gates.entry(id).or_default().viewer(&bytes[from..], !automatic));
             if let Some(link) = st.link(id) {
                 link.input(id, &now);
             }
@@ -311,9 +366,13 @@ impl Core {
         self.unsubscribe(&mut st, conn, channel);
         let mut touched = Vec::new();
         for (id, vs) in st.viewers.iter_mut() {
-            let before = vs.len();
-            vs.retain(|v| !(Arc::ptr_eq(&v.conn, conn) && channel.is_none_or(|c| c == v.channel)));
-            if vs.len() != before {
+            let mut typing_left = false;
+            vs.retain(|v| {
+                let leaves = Arc::ptr_eq(&v.conn, conn) && channel.is_none_or(|c| c == v.channel);
+                typing_left |= leaves && !v.observe;
+                !leaves
+            });
+            if typing_left {
                 touched.push(*id);
             }
         }
@@ -381,16 +440,42 @@ impl Core {
     }
 
     fn apply_display(&self, st: &mut State, id: u32, display: Option<&Display>) {
-        let Some(screen) = st.screens.get_mut(&id) else { return };
+        let answering = answering(st.viewers.get(&id));
+        let State { screens, relays, .. } = st;
+        let Some(screen) = screens.get_mut(&id) else { return };
         if let Some(d) = display {
             d.apply(screen);
         }
         // Display changes can notify an idle program, even without a resize or output.
-        let replies = Relay::take_responses(screen);
+        // In order behind a viewer's image answer; only output begins a wait.
+        let (replies, _) = relays.entry(id).or_default().take_replies(screen, answering);
+        let replies = ordered_replies(st.gates.entry(id).or_default(), &replies);
         if let Some(link) = st.link(id) {
             link.input(id, &replies);
         }
     }
+}
+
+/// DA1 must follow already queued viewer answers, even after their relay wait ended.
+/// Prompt queries and other screen replies remain immediate.
+fn ordered_replies(gate: &mut crate::input::Gate, replies: &[u8]) -> Vec<u8> {
+    let mut now = Vec::with_capacity(replies.len());
+    let mut i = 0;
+    while i < replies.len() {
+        if let Some(n) = crate::relay::da1_len(&replies[i..]) {
+            now.extend(gate.viewer(&replies[i..i + n], false));
+            i += n;
+        } else {
+            now.push(replies[i]);
+            i += 1;
+        }
+    }
+    now
+}
+
+/// Whether a viewer could answer an image: observers' replies never reach the program.
+fn answering(viewers: Option<&Vec<Viewer>>) -> bool {
+    viewers.is_some_and(|vs| vs.iter().any(|v| !v.observe))
 }
 
 /// The screen, then the latest 7501 report of every record and whether the
